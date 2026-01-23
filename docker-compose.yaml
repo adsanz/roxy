@@ -1,0 +1,36 @@
+services:
+  roxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: roxy:latest
+    container_name: roxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount your config file
+      - ./config.yaml:/etc/roxy/config.yaml:ro
+      # Mount CA certificates if using MITM TLS
+      # - ./certs:/etc/roxy/certs:ro
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 128M
+    # Health check (disabled - distroless has no shell)
+    # Use orchestrator-level health checks or add a /health endpoint
+    # Logging
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,55 @@
+# Roxy Proxy Configuration Example
+# Copy to config.yaml and customize
+
+listen: "0.0.0.0:8080"
+
+# TLS/MITM configuration (optional)
+# tls:
+#   ca_cert: "./ca.crt"
+#   ca_key: "./ca.key"
+#   cert_cache_size: 1000
+
+# Rate limit settings (optional)
+rate_limit:
+  cleanup_interval_secs: 60
+
+# Access control rules
+rules:
+  # Block requests to internal networks
+  - name: "block-internal"
+    rule: 'host("*.internal") || host("*.local") || host("10.*") || host("192.168.*") = block'
+
+  # Block specific user agents
+  - name: "block-bad-ua"
+    rule: 'header("User-Agent~*curl*") && !header("X-Allowed:true") = block : pass'
+
+  # Require auth header for API
+  - name: "require-auth"
+    rule: 'host("api.example.com") && !header("X-Auth") = block : pass'
+
+  # Rate limit API requests
+  - name: "api-rate-limit"
+    rule: 'host("api.*") && path("/v1/*") = rate_limit(100/s, header(X-Customer-Id))'
+
+  # Rate limit by IP for public endpoints
+  - name: "public-rate-limit"
+    rule: 'path("/public/*") = rate_limit(10/m, ip)'
+
+  # Mangle headers for backend requests
+  - name: "backend-headers"
+    rule: 'host("backend.*") = mangle'
+
+  # Allow only specific methods
+  - name: "allowed-methods"
+    rule: '!(method(GET) || method(POST) || method(HEAD) || method(CONNECT)) = block'
+
+# Header manipulation
+headers:
+  - rules: ["backend-headers"]
+    add:
+      - name: "X-Proxy-Processed"
+        value: "true"
+      - name: "X-Forwarded-By"
+        value: "roxy"
+    remove:
+      - "X-Internal-Debug"

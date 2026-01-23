@@ -1,0 +1,50 @@
+# Build artifacts
+target/
+debug/
+release/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+*.md
+!README.md
+docs/
+
+# Tests and benchmarks (not needed in image)
+benches/
+tests/
+**/tests/
+**/*_test.rs
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+Jenkinsfile
+
+# Development files
+.env*
+*.log
+*.bak
+*.tmp
+
+# Example configs (user provides their own)
+examples/
+config*.yaml
+!config.example.yaml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Rust
+rustfmt.toml
+.cargo/

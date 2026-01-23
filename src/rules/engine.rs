@@ -1,0 +1,383 @@
+//! Method-indexed rule engine for efficient evaluation.
+//!
+//! Rules are indexed by HTTP method for O(1) lookup of relevant rules.
+//! Rules without a method filter go in the `None` bucket and are always checked.
+
+use http::Method;
+use std::collections::HashMap;
+
+use crate::config::RuleConfig;
+use crate::error::ParseError;
+use crate::rules::ast::*;
+use crate::rules::parser::parse_rule;
+
+/// Result of rule evaluation.
+#[derive(Debug, Clone)]
+pub enum RuleResult {
+    /// No rules matched, continue processing
+    NoMatch,
+
+    /// Request should be blocked
+    Block { rule_name: String },
+
+    /// Request is allowed (stop further rule evaluation)
+    Pass { rule_name: String },
+
+    /// Request should have headers mangled
+    Mangle { rule_name: String },
+
+    /// Request should be rate limited
+    RateLimit {
+        rule_name: String,
+        requests: u64,
+        window_secs: u64,
+        key_expr: KeyExpr,
+    },
+}
+
+/// Rule engine that preserves config order for first-match-wins semantics.
+///
+/// Rules are stored in config order and optionally indexed by method for
+/// fast filtering. The evaluation respects the original order in the config file.
+pub struct RuleIndex {
+    /// All rules in config order, with their original index
+    rules: Vec<CompiledRule>,
+
+    /// Method index: maps method -> indices into `rules` vec (for fast filtering)
+    /// Rules without a method filter are in the `None` bucket.
+    method_index: HashMap<Option<Method>, Vec<usize>>,
+}
+
+impl RuleIndex {
+    /// Create a new empty rule index.
+    pub fn new() -> Self {
+        Self {
+            rules: Vec::new(),
+            method_index: HashMap::new(),
+        }
+    }
+
+    /// Build rule index from configuration.
+    /// Rules are evaluated in the order they appear in the config (first-match-wins).
+    pub fn from_config(rules: &[RuleConfig]) -> Result<Self, ParseError> {
+        let mut index = Self::new();
+
+        for rule_config in rules {
+            let compiled = parse_rule(&rule_config.name, &rule_config.rule)?;
+            index.add_rule(compiled);
+        }
+
+        Ok(index)
+    }
+
+    /// Add a compiled rule to the index.
+    pub fn add_rule(&mut self, rule: CompiledRule) {
+        let idx = self.rules.len();
+        let method_key = rule.indexed_method.clone();
+
+        self.rules.push(rule);
+        self.method_index.entry(method_key).or_default().push(idx);
+    }
+
+    /// Get total number of rules.
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// Evaluate rules against the request context.
+    ///
+    /// Rules are evaluated in **config order** (first-match-wins).
+    /// Only rules that could potentially match the request method are checked.
+    pub fn evaluate(&self, ctx: &EvalContext) -> RuleResult {
+        // Collect indices of rules to check:
+        // - Rules specific to this method
+        // - Wildcard rules (no method filter)
+        let method_indices = self.method_index.get(&Some(ctx.method.clone()));
+        let wildcard_indices = self.method_index.get(&None);
+
+        // Merge indices and sort to preserve config order
+        let mut indices: Vec<usize> = method_indices
+            .into_iter()
+            .flatten()
+            .chain(wildcard_indices.into_iter().flatten())
+            .copied()
+            .collect();
+        indices.sort_unstable();
+
+        // Evaluate in config order
+        for idx in indices {
+            let rule = &self.rules[idx];
+            let matched = rule.condition.evaluate(ctx);
+
+            if matched {
+                return self.action_to_result(&rule.name, &rule.action);
+            } else if let Some(else_action) = &rule.else_action {
+                return self.action_to_result(&rule.name, else_action);
+            }
+        }
+
+        RuleResult::NoMatch
+    }
+
+    /// Evaluate and collect all mangle rules that match.
+    /// Unlike `evaluate`, this doesn't short-circuit on first match.
+    pub fn evaluate_mangle_rules(&self, ctx: &EvalContext) -> Vec<String> {
+        let mut matched_rules = Vec::new();
+
+        let method_indices = self.method_index.get(&Some(ctx.method.clone()));
+        let wildcard_indices = self.method_index.get(&None);
+
+        let mut indices: Vec<usize> = method_indices
+            .into_iter()
+            .flatten()
+            .chain(wildcard_indices.into_iter().flatten())
+            .copied()
+            .collect();
+        indices.sort_unstable();
+
+        for idx in indices {
+            let rule = &self.rules[idx];
+            if rule.condition.evaluate(ctx) && matches!(rule.action, Action::Mangle) {
+                matched_rules.push(rule.name.clone());
+            }
+        }
+
+        matched_rules
+    }
+
+    fn action_to_result(&self, rule_name: &str, action: &Action) -> RuleResult {
+        match action {
+            Action::Block => RuleResult::Block {
+                rule_name: rule_name.to_string(),
+            },
+            Action::Pass => RuleResult::Pass {
+                rule_name: rule_name.to_string(),
+            },
+            Action::Mangle => RuleResult::Mangle {
+                rule_name: rule_name.to_string(),
+            },
+            Action::RateLimit {
+                requests,
+                window_secs,
+                key_expr,
+            } => RuleResult::RateLimit {
+                rule_name: rule_name.to_string(),
+                requests: *requests,
+                window_secs: *window_secs,
+                key_expr: key_expr.clone(),
+            },
+        }
+    }
+}
+
+impl Default for RuleIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_ctx<'a>(
+        host: &'a str,
+        path: &'a str,
+        method: Method,
+        headers: &'a HashMap<String, String>,
+    ) -> EvalContext<'a> {
+        EvalContext {
+            host,
+            path,
+            method,
+            headers,
+            client_ip: None,
+        }
+    }
+
+    #[test]
+    fn test_empty_index_returns_no_match() {
+        let index = RuleIndex::new();
+        let headers = HashMap::new();
+        let ctx = make_ctx("example.com", "/", Method::GET, &headers);
+
+        assert!(matches!(index.evaluate(&ctx), RuleResult::NoMatch));
+    }
+
+    #[test]
+    fn test_method_indexed_lookup() {
+        let mut index = RuleIndex::new();
+
+        // Add GET-specific rule
+        let rule = parse_rule("get-only", r#"method(GET) && host("*.com") = pass"#).unwrap();
+        index.add_rule(rule);
+
+        // Add POST-specific rule
+        let rule = parse_rule("post-only", r#"method(POST) && host("*.com") = block"#).unwrap();
+        index.add_rule(rule);
+
+        let headers = HashMap::new();
+
+        // GET request should match get-only rule
+        let ctx = make_ctx("test.com", "/", Method::GET, &headers);
+        assert!(matches!(
+            index.evaluate(&ctx),
+            RuleResult::Pass { rule_name } if rule_name == "get-only"
+        ));
+
+        // POST request should match post-only rule
+        let ctx = make_ctx("test.com", "/", Method::POST, &headers);
+        assert!(matches!(
+            index.evaluate(&ctx),
+            RuleResult::Block { rule_name } if rule_name == "post-only"
+        ));
+
+        // DELETE request should not match
+        let ctx = make_ctx("test.com", "/", Method::DELETE, &headers);
+        assert!(matches!(index.evaluate(&ctx), RuleResult::NoMatch));
+    }
+
+    #[test]
+    fn test_wildcard_rules_always_checked() {
+        let mut index = RuleIndex::new();
+
+        // Add a rule without method filter (goes to wildcard bucket)
+        let rule = parse_rule("all-methods", r#"host("blocked.com") = block"#).unwrap();
+        index.add_rule(rule);
+
+        let headers = HashMap::new();
+
+        // Should match for any method
+        for method in [Method::GET, Method::POST, Method::DELETE, Method::PUT] {
+            let ctx = make_ctx("blocked.com", "/", method, &headers);
+            assert!(matches!(
+                index.evaluate(&ctx),
+                RuleResult::Block { rule_name } if rule_name == "all-methods"
+            ));
+        }
+    }
+
+    #[test]
+    fn test_first_match_wins() {
+        let mut index = RuleIndex::new();
+
+        // First rule blocks
+        let rule = parse_rule("first", r#"host("*.com") = block"#).unwrap();
+        index.add_rule(rule);
+
+        // Second rule passes (should never be reached)
+        let rule = parse_rule("second", r#"host("test.com") = pass"#).unwrap();
+        index.add_rule(rule);
+
+        let headers = HashMap::new();
+        let ctx = make_ctx("test.com", "/", Method::GET, &headers);
+
+        assert!(matches!(
+            index.evaluate(&ctx),
+            RuleResult::Block { rule_name } if rule_name == "first"
+        ));
+    }
+
+    #[test]
+    fn test_ternary_else_action() {
+        let mut index = RuleIndex::new();
+
+        let rule = parse_rule("ternary", r#"header("X-Auth") = pass : block"#).unwrap();
+        index.add_rule(rule);
+
+        // With header: should pass
+        let mut headers = HashMap::new();
+        headers.insert("x-auth".to_string(), "token".to_string());
+        let ctx = make_ctx("test.com", "/", Method::GET, &headers);
+        assert!(matches!(index.evaluate(&ctx), RuleResult::Pass { .. }));
+
+        // Without header: should block
+        let headers = HashMap::new();
+        let ctx = make_ctx("test.com", "/", Method::GET, &headers);
+        assert!(matches!(index.evaluate(&ctx), RuleResult::Block { .. }));
+    }
+
+    #[test]
+    fn test_config_order_preserved() {
+        // This test verifies that rules are evaluated in config order,
+        // even when mixing method-specific and wildcard rules.
+        let rules = vec![
+            RuleConfig {
+                name: "allow-health".to_string(),
+                rule: r#"path("/health") = pass"#.to_string(),
+            },
+            RuleConfig {
+                name: "allow-payment".to_string(),
+                rule: r#"method(POST) && path("/payment") = pass"#.to_string(),
+            },
+            RuleConfig {
+                name: "block-all".to_string(),
+                rule: r#"host("*") = block"#.to_string(),
+            },
+        ];
+
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let headers = HashMap::new();
+
+        // Health check should pass (rule 1)
+        let ctx = make_ctx("api.example.com", "/health", Method::GET, &headers);
+        assert!(matches!(
+            index.evaluate(&ctx),
+            RuleResult::Pass { rule_name } if rule_name == "allow-health"
+        ));
+
+        // Payment should pass (rule 2)
+        let ctx = make_ctx("api.example.com", "/payment", Method::POST, &headers);
+        assert!(matches!(
+            index.evaluate(&ctx),
+            RuleResult::Pass { rule_name } if rule_name == "allow-payment"
+        ));
+
+        // Everything else should be blocked (rule 3)
+        let ctx = make_ctx("api.example.com", "/users", Method::GET, &headers);
+        assert!(matches!(
+            index.evaluate(&ctx),
+            RuleResult::Block { rule_name } if rule_name == "block-all"
+        ));
+    }
+
+    #[test]
+    fn test_evaluate_mangle_rules() {
+        let mut index = RuleIndex::new();
+
+        let rule = parse_rule("mangle1", r#"host("api.*") = mangle"#).unwrap();
+        index.add_rule(rule);
+
+        let rule = parse_rule("mangle2", r#"path("/v1/*") = mangle"#).unwrap();
+        index.add_rule(rule);
+
+        let rule = parse_rule("block", r#"host("blocked.com") = block"#).unwrap();
+        index.add_rule(rule);
+
+        let headers = HashMap::new();
+        let ctx = make_ctx("api.example.com", "/v1/users", Method::GET, &headers);
+
+        let matched = index.evaluate_mangle_rules(&ctx);
+        assert_eq!(matched.len(), 2);
+        assert!(matched.contains(&"mangle1".to_string()));
+        assert!(matched.contains(&"mangle2".to_string()));
+    }
+
+    #[test]
+    fn test_from_config() {
+        let configs = vec![
+            RuleConfig {
+                name: "rule1".to_string(),
+                rule: r#"host("*.internal") = block"#.to_string(),
+            },
+            RuleConfig {
+                name: "rule2".to_string(),
+                rule: r#"method(GET) = pass"#.to_string(),
+            },
+        ];
+
+        let index = RuleIndex::from_config(&configs).unwrap();
+        assert_eq!(index.rule_count(), 2);
+    }
+}
