@@ -2,6 +2,7 @@
 target/
 debug/
 release/
+tests/
 
 # Git
 .git/
