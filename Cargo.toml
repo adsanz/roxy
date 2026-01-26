@@ -38,6 +38,18 @@ http = "1"
 hyper = "1"
 bytes = "1"
 
+# Base64 decoding for PEM certificates
+base64 = "0.22"
+
+# Time handling for certificate validity
+time = "0.3"
+
+# Async cache for certificate caching (same version as hudsucker)
+moka = { version = "0.12", features = ["future"] }
+
+# Random number generation for certificate serial numbers
+rand = "0.9"
+
 [dev-dependencies]
 criterion = "0.5"
 

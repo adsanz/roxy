@@ -1402,6 +1402,7 @@ dependencies = [
 name = "roxy"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "criterion",
  "dashmap",
@@ -1410,10 +1411,13 @@ dependencies = [
  "hudsucker",
  "hyper",
  "lru",
+ "moka",
  "nom",
+ "rand",
  "serde",
  "serde_yaml",
  "thiserror",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -3,7 +3,6 @@
 //! Built on Hudsucker with a custom rule DSL.
 
 use hudsucker::{
-    certificate_authority::RcgenAuthority,
     rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose},
     rustls::crypto::aws_lc_rs,
     Proxy,
@@ -15,7 +14,7 @@ use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use roxy::config::ProxyConfig;
-use roxy::proxy::RoxyHandler;
+use roxy::proxy::{RoxyAuthority, RoxyHandler};
 use roxy::ratelimit::RateLimiter;
 use roxy::rules::RuleIndex;
 
@@ -72,7 +71,7 @@ fn setup_logging() {
 
 /// Create a Certificate Authority for MITM.
 /// Uses config if provided, otherwise generates an ephemeral CA.
-fn create_ca(config: &ProxyConfig) -> RcgenAuthority {
+fn create_ca(config: &ProxyConfig) -> RoxyAuthority {
     if let Some(tls_config) = &config.tls {
         // Load CA from files
         let key_pem = std::fs::read_to_string(&tls_config.ca_key)
@@ -100,7 +99,7 @@ fn create_ca(config: &ProxyConfig) -> RcgenAuthority {
             });
 
         info!(target: "proxy", "Loaded CA from config");
-        RcgenAuthority::new(issuer, tls_config.cert_cache_size as u64, aws_lc_rs::default_provider())
+        RoxyAuthority::new(issuer, &cert_pem, tls_config.cert_cache_size as u64, aws_lc_rs::default_provider())
     } else {
         // Generate ephemeral CA
         info!(target: "proxy", "Generating ephemeral CA (use tls config for persistent CA)");
@@ -115,11 +114,12 @@ fn create_ca(config: &ProxyConfig) -> RcgenAuthority {
 
         let key_pair = KeyPair::generate().expect("Failed to generate CA key");
         let cert = params.self_signed(&key_pair).expect("Failed to generate CA cert");
+        let cert_pem = cert.pem();
         
-        let issuer = hudsucker::rcgen::Issuer::from_ca_cert_pem(&cert.pem(), key_pair)
+        let issuer = hudsucker::rcgen::Issuer::from_ca_cert_pem(&cert_pem, key_pair)
             .expect("Failed to create issuer from generated CA");
 
-        RcgenAuthority::new(issuer, 1000, aws_lc_rs::default_provider())
+        RoxyAuthority::new(issuer, &cert_pem, 1000, aws_lc_rs::default_provider())
     }
 }
 
