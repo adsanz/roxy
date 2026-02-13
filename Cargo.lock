@@ -1476,7 +1476,6 @@ dependencies = [
 name = "roxy"
 version = "0.1.0"
 dependencies = [
- "base64",
  "chrono",
  "criterion",
  "dashmap",
@@ -1487,6 +1486,7 @@ dependencies = [
  "hyper-util",
  "moka",
  "nom",
+ "pem",
  "rand",
  "serde",
  "serde_yaml",

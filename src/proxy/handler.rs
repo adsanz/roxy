@@ -14,7 +14,9 @@ use tracing::{debug, info};
 
 use crate::config::{HeaderMangleConfig, ThrottleConfig};
 use crate::ratelimit::{CreditManager, CreditResult, RateLimitResult, RateLimiter};
-use crate::rules::{EvalContext, KeyExpr, RuleIndex, RuleResult, extract_ip_key, extract_key};
+use crate::rules::{
+    Action, EvalContext, KeyExpr, RuleIndex, RuleMatch, extract_ip_key, extract_key,
+};
 
 /// Roxy HTTP handler implementing Hudsucker's HttpHandler trait.
 #[derive(Clone)]
@@ -154,37 +156,24 @@ impl RoxyHandler {
         Some(self.rate_limiter.check(&ip_key, requests, window_secs))
     }
 
-    /// Create an error response.
-    fn error_response(status: StatusCode, message: &str) -> Response<Body> {
-        Response::builder()
+    /// Build an HTTP error/rejection response.
+    ///
+    /// If `retry_after` is `Some`, a `Retry-After` header is added (for 429s).
+    fn build_response(
+        status: StatusCode,
+        message: &str,
+        retry_after: Option<u64>,
+    ) -> Response<Body> {
+        let mut builder = Response::builder()
             .status(status)
             .header("Content-Type", "text/plain")
-            .header("Content-Length", message.len())
+            .header("Content-Length", message.len());
+        if let Some(secs) = retry_after {
+            builder = builder.header("Retry-After", secs.to_string());
+        }
+        builder
             .body(Body::from(message.to_string()))
             .unwrap_or_else(|_| Response::new(Body::from("Internal proxy error")))
-    }
-
-    /// Create a rate limit response with Retry-After header.
-    fn rate_limit_response(retry_after_secs: u64) -> Response<Body> {
-        let message = "Rate limit exceeded";
-        Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
-            .header("Content-Type", "text/plain")
-            .header("Content-Length", message.len())
-            .header("Retry-After", retry_after_secs.to_string())
-            .body(Body::from(message.to_string()))
-            .unwrap_or_else(|_| Response::new(Body::from("Rate limit exceeded")))
-    }
-
-    /// Create a credit exhaustion response with custom message.
-    fn credit_exhausted_response(retry_after_secs: u64, message: &str) -> Response<Body> {
-        Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
-            .header("Content-Type", "text/plain")
-            .header("Content-Length", message.len())
-            .header("Retry-After", retry_after_secs.to_string())
-            .body(Body::from(message.to_string()))
-            .unwrap_or_else(|_| Response::new(Body::from("Credit exhausted")))
     }
 
     /// Compute progressive delay for rate limiting when a throttle config exists.
@@ -256,189 +245,47 @@ impl HttpHandler for RoxyHandler {
         let mut matched_rule: Option<String> = None;
         let mut matched_headers: HashMap<String, String> = HashMap::new();
 
-        match result {
-            RuleResult::NoMatch => {
-                debug!(target: "rules", "No rules matched");
-            }
-            RuleResult::Block {
+        if let Some(rule_match) = result {
+            let RuleMatch {
                 rule_name,
                 logged_headers,
-            } => {
-                info!(
-                    target: "proxy",
-                    method = %method,
-                    host = %host,
-                    path = %path,
-                    rule = %rule_name,
-                    action = "block",
-                    status = 403,
-                    headers = ?logged_headers
-                );
-                return Self::error_response(StatusCode::FORBIDDEN, "Not Allowed").into();
-            }
-            RuleResult::Pass {
-                rule_name,
-                logged_headers,
-            } => {
-                debug!(target: "rules", rule = %rule_name, action = "pass");
-                matched_rule = Some(rule_name);
-                matched_headers = logged_headers;
-            }
-            RuleResult::Mangle {
-                rule_name,
-                logged_headers,
-            } => {
-                debug!(target: "rules", rule = %rule_name, action = "mangle");
-                matched_rule = Some(rule_name);
-                matched_headers = logged_headers;
-            }
-            RuleResult::RateLimit {
-                rule_name,
-                requests,
-                window_secs,
-                key_expr,
-                mangle,
-                logged_headers,
-            } => {
-                // IP baseline check: prevent bypass by varying header values
-                if let Some(RateLimitResult::Limited { retry_after_secs }) =
-                    self.check_ip_baseline(&rule_name, &key_expr, requests, window_secs, &eval_ctx)
-                {
+                action,
+            } = rule_match;
+
+            match action {
+                Action::Block => {
                     info!(
                         target: "proxy",
                         method = %method,
                         host = %host,
                         path = %path,
                         rule = %rule_name,
-                        action = "rate_limited",
-                        reason = "ip_baseline",
-                        status = 429,
+                        action = "block",
+                        status = 403,
                         headers = ?logged_headers
                     );
-                    return Self::rate_limit_response(retry_after_secs).into();
+                    return Self::build_response(StatusCode::FORBIDDEN, "Not Allowed", None).into();
                 }
-
-                // Per-key rate limit check
-                match self.check_rate_limit(&key_expr, requests, window_secs, &eval_ctx) {
-                    RateLimitResult::Allowed { remaining } => {
-                        if let Some(delay_ms) =
-                            self.compute_throttle_delay(&rule_name, remaining, requests)
-                        {
-                            debug!(target: "ratelimit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        } else {
-                            debug!(target: "ratelimit", rule = %rule_name, remaining);
-                        }
-                        if mangle {
-                            mangle_rules.push(rule_name.clone());
-                        }
-                        matched_rule = Some(rule_name);
-                        matched_headers = logged_headers;
-                    }
-                    RateLimitResult::Limited { retry_after_secs } => {
-                        info!(
-                            target: "proxy",
-                            method = %method,
-                            host = %host,
-                            path = %path,
-                            rule = %rule_name,
-                            action = "rate_limited",
-                            status = 429,
-                            headers = ?logged_headers
-                        );
-                        return Self::rate_limit_response(retry_after_secs).into();
-                    }
+                Action::Pass => {
+                    debug!(target: "rules", rule = %rule_name, action = "pass");
+                    matched_rule = Some(rule_name);
+                    matched_headers = logged_headers;
                 }
-            }
-            RuleResult::Credit {
-                rule_name,
-                credits: _,
-                period: _,
-                key_expr,
-                mangle,
-                logged_headers,
-            } => {
-                let key = extract_key(&key_expr, &eval_ctx);
-                let result = self.credit_manager.check(&rule_name, &key);
-                match result {
-                    CreditResult::Allowed { remaining } => {
-                        debug!(target: "credit", rule = %rule_name, remaining);
-                        if mangle {
-                            mangle_rules.push(rule_name.clone());
-                        }
-                        matched_rule = Some(rule_name);
-                        matched_headers = logged_headers;
-                    }
-                    CreditResult::Throttled {
-                        remaining,
-                        delay_ms,
-                    } => {
-                        debug!(target: "credit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        if mangle {
-                            mangle_rules.push(rule_name.clone());
-                        }
-                        matched_rule = Some(rule_name);
-                        matched_headers = logged_headers;
-                    }
-                    CreditResult::Exhausted {
-                        retry_after_secs,
-                        reset_time,
-                    } => {
-                        let message = self
-                            .credit_manager
-                            .format_exhaustion_message(&rule_name, &reset_time);
-                        info!(
-                            target: "proxy",
-                            method = %method,
-                            host = %host,
-                            path = %path,
-                            rule = %rule_name,
-                            action = "credit_exhausted",
-                            status = 429,
-                            reset_time = %reset_time,
-                            headers = ?logged_headers
-                        );
-                        return Self::credit_exhausted_response(retry_after_secs, &message).into();
-                    }
+                Action::Mangle => {
+                    debug!(target: "rules", rule = %rule_name, action = "mangle");
+                    matched_rule = Some(rule_name);
+                    matched_headers = logged_headers;
                 }
-            }
-            RuleResult::RateLimitCredit {
-                rule_name,
-                requests,
-                window_secs,
-                rate_key_expr,
-                credits: _,
-                period: _,
-                credit_key_expr,
-                mangle,
-                logged_headers,
-            } => {
-                // Step 0: IP baseline check (prevents header-flooding bypass)
-                if let Some(RateLimitResult::Limited { retry_after_secs }) = self.check_ip_baseline(
-                    &rule_name,
-                    &rate_key_expr,
+                Action::RateLimit {
                     requests,
                     window_secs,
-                    &eval_ctx,
-                ) {
-                    info!(
-                        target: "proxy",
-                        method = %method,
-                        host = %host,
-                        path = %path,
-                        rule = %rule_name,
-                        action = "rate_limited",
-                        reason = "ip_baseline",
-                        status = 429,
-                        headers = ?logged_headers
-                    );
-                    return Self::rate_limit_response(retry_after_secs).into();
-                }
-
-                // Step 1: Per-key rate limit check (burst protection)
-                match self.check_rate_limit(&rate_key_expr, requests, window_secs, &eval_ctx) {
-                    RateLimitResult::Limited { retry_after_secs } => {
+                    key_expr,
+                    mangle,
+                } => {
+                    // IP baseline check: prevent bypass by varying header values
+                    if let Some(RateLimitResult::Limited { retry_after_secs }) = self
+                        .check_ip_baseline(&rule_name, &key_expr, requests, window_secs, &eval_ctx)
+                    {
                         info!(
                             target: "proxy",
                             method = %method,
@@ -446,72 +293,236 @@ impl HttpHandler for RoxyHandler {
                             path = %path,
                             rule = %rule_name,
                             action = "rate_limited",
+                            reason = "ip_baseline",
                             status = 429,
                             headers = ?logged_headers
                         );
-                        return Self::rate_limit_response(retry_after_secs).into();
+                        return Self::build_response(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "Rate limit exceeded",
+                            Some(retry_after_secs),
+                        )
+                        .into();
                     }
-                    RateLimitResult::Allowed { remaining } => {
-                        // Step 2: Credit check (budget enforcement)
-                        let credit_key = extract_key(&credit_key_expr, &eval_ctx);
-                        let credit_result = self.credit_manager.check(&rule_name, &credit_key);
-                        match credit_result {
-                            CreditResult::Exhausted {
-                                retry_after_secs,
-                                reset_time,
-                            } => {
-                                let message = self
-                                    .credit_manager
-                                    .format_exhaustion_message(&rule_name, &reset_time);
-                                info!(
-                                    target: "proxy",
-                                    method = %method,
-                                    host = %host,
-                                    path = %path,
-                                    rule = %rule_name,
-                                    action = "credit_exhausted",
-                                    status = 429,
-                                    reset_time = %reset_time,
-                                    headers = ?logged_headers
-                                );
-                                return Self::credit_exhausted_response(retry_after_secs, &message)
-                                    .into();
-                            }
-                            CreditResult::Throttled {
-                                remaining: _,
-                                delay_ms: credit_delay,
-                            } => {
-                                let rl_delay = self
-                                    .compute_throttle_delay(&rule_name, remaining, requests)
-                                    .unwrap_or(0);
-                                let max_delay = credit_delay.max(rl_delay);
-                                debug!(target: "proxy", rule = %rule_name, credit_delay, rl_delay, max_delay, "Composite throttle");
-                                tokio::time::sleep(std::time::Duration::from_millis(max_delay))
+
+                    // Per-key rate limit check
+                    match self.check_rate_limit(&key_expr, requests, window_secs, &eval_ctx) {
+                        RateLimitResult::Allowed { remaining } => {
+                            if let Some(delay_ms) =
+                                self.compute_throttle_delay(&rule_name, remaining, requests)
+                            {
+                                debug!(target: "ratelimit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
                                     .await;
-                                if mangle {
-                                    mangle_rules.push(rule_name.clone());
-                                }
-                                matched_rule = Some(rule_name);
-                                matched_headers = logged_headers;
+                            } else {
+                                debug!(target: "ratelimit", rule = %rule_name, remaining);
                             }
-                            CreditResult::Allowed { remaining: _ } => {
-                                if let Some(delay_ms) =
-                                    self.compute_throttle_delay(&rule_name, remaining, requests)
-                                {
-                                    debug!(target: "ratelimit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
-                                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                            if mangle {
+                                mangle_rules.push(rule_name.clone());
+                            }
+                            matched_rule = Some(rule_name);
+                            matched_headers = logged_headers;
+                        }
+                        RateLimitResult::Limited { retry_after_secs } => {
+                            info!(
+                                target: "proxy",
+                                method = %method,
+                                host = %host,
+                                path = %path,
+                                rule = %rule_name,
+                                action = "rate_limited",
+                                status = 429,
+                                headers = ?logged_headers
+                            );
+                            return Self::build_response(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "Rate limit exceeded",
+                                Some(retry_after_secs),
+                            )
+                            .into();
+                        }
+                    }
+                }
+                Action::Credit {
+                    key_expr, mangle, ..
+                } => {
+                    let key = extract_key(&key_expr, &eval_ctx);
+                    let credit_result = self.credit_manager.check(&rule_name, &key);
+                    match credit_result {
+                        CreditResult::Allowed { remaining } => {
+                            debug!(target: "credit", rule = %rule_name, remaining);
+                            if mangle {
+                                mangle_rules.push(rule_name.clone());
+                            }
+                            matched_rule = Some(rule_name);
+                            matched_headers = logged_headers;
+                        }
+                        CreditResult::Throttled {
+                            remaining,
+                            delay_ms,
+                        } => {
+                            debug!(target: "credit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            if mangle {
+                                mangle_rules.push(rule_name.clone());
+                            }
+                            matched_rule = Some(rule_name);
+                            matched_headers = logged_headers;
+                        }
+                        CreditResult::Exhausted {
+                            retry_after_secs,
+                            reset_time,
+                        } => {
+                            let message = self
+                                .credit_manager
+                                .format_exhaustion_message(&rule_name, &reset_time);
+                            info!(
+                                target: "proxy",
+                                method = %method,
+                                host = %host,
+                                path = %path,
+                                rule = %rule_name,
+                                action = "credit_exhausted",
+                                status = 429,
+                                reset_time = %reset_time,
+                                headers = ?logged_headers
+                            );
+                            return Self::build_response(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                &message,
+                                Some(retry_after_secs),
+                            )
+                            .into();
+                        }
+                    }
+                }
+                Action::RateLimitCredit {
+                    requests,
+                    window_secs,
+                    rate_key_expr,
+                    credit_key_expr,
+                    mangle,
+                    ..
+                } => {
+                    // Step 0: IP baseline check (prevents header-flooding bypass)
+                    if let Some(RateLimitResult::Limited { retry_after_secs }) = self
+                        .check_ip_baseline(
+                            &rule_name,
+                            &rate_key_expr,
+                            requests,
+                            window_secs,
+                            &eval_ctx,
+                        )
+                    {
+                        info!(
+                            target: "proxy",
+                            method = %method,
+                            host = %host,
+                            path = %path,
+                            rule = %rule_name,
+                            action = "rate_limited",
+                            reason = "ip_baseline",
+                            status = 429,
+                            headers = ?logged_headers
+                        );
+                        return Self::build_response(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "Rate limit exceeded",
+                            Some(retry_after_secs),
+                        )
+                        .into();
+                    }
+
+                    // Step 1: Per-key rate limit check (burst protection)
+                    match self.check_rate_limit(&rate_key_expr, requests, window_secs, &eval_ctx) {
+                        RateLimitResult::Limited { retry_after_secs } => {
+                            info!(
+                                target: "proxy",
+                                method = %method,
+                                host = %host,
+                                path = %path,
+                                rule = %rule_name,
+                                action = "rate_limited",
+                                status = 429,
+                                headers = ?logged_headers
+                            );
+                            return Self::build_response(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "Rate limit exceeded",
+                                Some(retry_after_secs),
+                            )
+                            .into();
+                        }
+                        RateLimitResult::Allowed { remaining } => {
+                            // Step 2: Credit check (budget enforcement)
+                            let credit_key = extract_key(&credit_key_expr, &eval_ctx);
+                            let credit_result = self.credit_manager.check(&rule_name, &credit_key);
+                            match credit_result {
+                                CreditResult::Exhausted {
+                                    retry_after_secs,
+                                    reset_time,
+                                } => {
+                                    let message = self
+                                        .credit_manager
+                                        .format_exhaustion_message(&rule_name, &reset_time);
+                                    info!(
+                                        target: "proxy",
+                                        method = %method,
+                                        host = %host,
+                                        path = %path,
+                                        rule = %rule_name,
+                                        action = "credit_exhausted",
+                                        status = 429,
+                                        reset_time = %reset_time,
+                                        headers = ?logged_headers
+                                    );
+                                    return Self::build_response(
+                                        StatusCode::TOO_MANY_REQUESTS,
+                                        &message,
+                                        Some(retry_after_secs),
+                                    )
+                                    .into();
+                                }
+                                CreditResult::Throttled {
+                                    remaining: _,
+                                    delay_ms: credit_delay,
+                                } => {
+                                    let rl_delay = self
+                                        .compute_throttle_delay(&rule_name, remaining, requests)
+                                        .unwrap_or(0);
+                                    let max_delay = credit_delay.max(rl_delay);
+                                    debug!(target: "proxy", rule = %rule_name, credit_delay, rl_delay, max_delay, "Composite throttle");
+                                    tokio::time::sleep(std::time::Duration::from_millis(max_delay))
                                         .await;
+                                    if mangle {
+                                        mangle_rules.push(rule_name.clone());
+                                    }
+                                    matched_rule = Some(rule_name);
+                                    matched_headers = logged_headers;
                                 }
-                                if mangle {
-                                    mangle_rules.push(rule_name.clone());
+                                CreditResult::Allowed { remaining: _ } => {
+                                    if let Some(delay_ms) =
+                                        self.compute_throttle_delay(&rule_name, remaining, requests)
+                                    {
+                                        debug!(target: "ratelimit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            delay_ms,
+                                        ))
+                                        .await;
+                                    }
+                                    if mangle {
+                                        mangle_rules.push(rule_name.clone());
+                                    }
+                                    matched_rule = Some(rule_name);
+                                    matched_headers = logged_headers;
                                 }
-                                matched_rule = Some(rule_name);
-                                matched_headers = logged_headers;
                             }
                         }
                     }
                 }
             }
+        } else {
+            debug!(target: "rules", "No rules matched");
         }
 
         // Apply header modifications for matched mangle rules
@@ -553,38 +564,15 @@ impl HttpHandler for RoxyHandler {
         }
 
         // Log the forwarded request (single info log per request)
-        match (&matched_rule, matched_headers.is_empty()) {
-            (Some(rule), true) => {
-                info!(
-                    target: "proxy",
-                    method = %method,
-                    host = %host,
-                    path = %path,
-                    rule = %rule,
-                    action = "forward"
-                );
-            }
-            (Some(rule), false) => {
-                info!(
-                    target: "proxy",
-                    method = %method,
-                    host = %host,
-                    path = %path,
-                    rule = %rule,
-                    action = "forward",
-                    headers = ?matched_headers
-                );
-            }
-            (None, _) => {
-                info!(
-                    target: "proxy",
-                    method = %method,
-                    host = %host,
-                    path = %path,
-                    action = "forward"
-                );
-            }
-        }
+        info!(
+            target: "proxy",
+            method = %method,
+            host = %host,
+            path = %path,
+            rule = ?matched_rule,
+            action = "forward",
+            headers = ?matched_headers
+        );
 
         // Reconstruct request and forward
         Request::from_parts(parts, body).into()
@@ -647,14 +635,19 @@ mod tests {
     }
 
     #[test]
-    fn test_error_response() {
-        let resp = RoxyHandler::error_response(StatusCode::FORBIDDEN, "Forbidden");
+    fn test_build_response_error() {
+        let resp = RoxyHandler::build_response(StatusCode::FORBIDDEN, "Forbidden", None);
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get("retry-after").is_none());
     }
 
     #[test]
-    fn test_rate_limit_response() {
-        let resp = RoxyHandler::rate_limit_response(60);
+    fn test_build_response_rate_limit() {
+        let resp = RoxyHandler::build_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded",
+            Some(60),
+        );
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(resp.headers().get("retry-after").unwrap(), "60");
     }

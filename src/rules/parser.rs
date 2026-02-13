@@ -598,8 +598,8 @@ fn parse_key_extractor(input: &str) -> RResult<'_, KeyExtractor> {
 /// Parse host key extractor
 fn parse_key_host(input: &str) -> RResult<'_, KeyExtractor> {
     let (input, _) = ws(tag_no_case("host"))(input)?;
-    let (input, pattern) = delimited(ws(char('(')), parse_key_pattern, ws(char(')')))(input)?;
-    Ok((input, KeyExtractor::Host(pattern)))
+    let (input, _) = delimited(ws(char('(')), parse_key_pattern, ws(char(')')))(input)?;
+    Ok((input, KeyExtractor::Host))
 }
 
 /// Parse header key extractor
@@ -612,8 +612,8 @@ fn parse_key_header(input: &str) -> RResult<'_, KeyExtractor> {
 /// Parse path key extractor
 fn parse_key_path(input: &str) -> RResult<'_, KeyExtractor> {
     let (input, _) = ws(tag_no_case("path"))(input)?;
-    let (input, pattern) = delimited(ws(char('(')), parse_key_pattern, ws(char(')')))(input)?;
-    Ok((input, KeyExtractor::Path(pattern)))
+    let (input, _) = delimited(ws(char('(')), parse_key_pattern, ws(char(')')))(input)?;
+    Ok((input, KeyExtractor::Path))
 }
 
 /// Parse key pattern: * (full value) or a specific pattern

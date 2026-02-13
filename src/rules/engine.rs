@@ -11,71 +11,19 @@ use crate::error::ParseError;
 use crate::rules::ast::*;
 use crate::rules::parser::parse_rule;
 
-/// Result of rule evaluation.
+/// Result of rule evaluation: the matched action plus metadata.
+///
+/// Wraps `Action` with the rule name and any logged headers, avoiding
+/// duplication of those fields across every action variant.
+/// `None` means no rules matched.
 #[derive(Debug, Clone)]
-pub enum RuleResult {
-    /// No rules matched, continue processing
-    NoMatch,
-
-    /// Request should be blocked
-    Block {
-        rule_name: String,
-        /// Headers to log (existence-only checks with their values)
-        logged_headers: HashMap<String, String>,
-    },
-
-    /// Request is allowed (stop further rule evaluation)
-    Pass {
-        rule_name: String,
-        /// Headers to log (existence-only checks with their values)
-        logged_headers: HashMap<String, String>,
-    },
-
-    /// Request should have headers mangled
-    Mangle {
-        rule_name: String,
-        /// Headers to log (existence-only checks with their values)
-        logged_headers: HashMap<String, String>,
-    },
-
-    /// Request should be rate limited
-    RateLimit {
-        rule_name: String,
-        requests: u64,
-        window_secs: u64,
-        key_expr: KeyExpr,
-        /// Also apply header mangling for this rule
-        mangle: bool,
-        /// Headers to log (existence-only checks with their values)
-        logged_headers: HashMap<String, String>,
-    },
-
-    /// Request should be credit-checked
-    Credit {
-        rule_name: String,
-        credits: u64,
-        period: CreditPeriod,
-        key_expr: KeyExpr,
-        /// Also apply header mangling for this rule
-        mangle: bool,
-        /// Headers to log (existence-only checks with their values)
-        logged_headers: HashMap<String, String>,
-    },
-
-    /// Request should be both rate-limited (burst) and credit-checked (budget)
-    RateLimitCredit {
-        rule_name: String,
-        requests: u64,
-        window_secs: u64,
-        rate_key_expr: KeyExpr,
-        credits: u64,
-        period: CreditPeriod,
-        credit_key_expr: KeyExpr,
-        /// Also apply header mangling for this rule
-        mangle: bool,
-        /// Headers to log (existence-only checks with their values)
-        logged_headers: HashMap<String, String>,
-    },
+pub struct RuleMatch {
+    /// Name of the rule that matched
+    pub rule_name: String,
+    /// Headers to log (existence-only checks with their values)
+    pub logged_headers: HashMap<String, String>,
+    /// The action to take
+    pub action: Action,
 }
 
 /// Rule engine that preserves config order for first-match-wins semantics.
@@ -219,7 +167,8 @@ impl RuleIndex {
     ///
     /// Rules are evaluated in **config order** (first-match-wins).
     /// Only rules that could potentially match the request method are checked.
-    pub fn evaluate(&self, ctx: &EvalContext) -> RuleResult {
+    /// Returns `None` if no rules matched.
+    pub fn evaluate(&self, ctx: &EvalContext) -> Option<RuleMatch> {
         // Collect indices of rules to check:
         // - Rules specific to this method
         // - Wildcard rules (no method filter)
@@ -240,16 +189,23 @@ impl RuleIndex {
             let rule = &self.rules[idx];
             let matched = rule.condition.evaluate(ctx);
 
-            if matched {
+            let action = if matched {
+                Some(&rule.action)
+            } else {
+                rule.else_action.as_ref()
+            };
+
+            if let Some(action) = action {
                 let logged_headers = self.collect_logged_headers(rule, ctx);
-                return self.action_to_result(&rule.name, &rule.action, logged_headers);
-            } else if let Some(else_action) = &rule.else_action {
-                let logged_headers = self.collect_logged_headers(rule, ctx);
-                return self.action_to_result(&rule.name, else_action, logged_headers);
+                return Some(RuleMatch {
+                    rule_name: rule.name.clone(),
+                    logged_headers,
+                    action: action.clone(),
+                });
             }
         }
 
-        RuleResult::NoMatch
+        None
     }
 
     /// Collect header values for headers that are existence-only checks in the rule.
@@ -296,73 +252,6 @@ impl RuleIndex {
 
         matched_rules
     }
-
-    fn action_to_result(
-        &self,
-        rule_name: &str,
-        action: &Action,
-        logged_headers: HashMap<String, String>,
-    ) -> RuleResult {
-        match action {
-            Action::Block => RuleResult::Block {
-                rule_name: rule_name.to_string(),
-                logged_headers,
-            },
-            Action::Pass => RuleResult::Pass {
-                rule_name: rule_name.to_string(),
-                logged_headers,
-            },
-            Action::Mangle => RuleResult::Mangle {
-                rule_name: rule_name.to_string(),
-                logged_headers,
-            },
-            Action::RateLimit {
-                requests,
-                window_secs,
-                key_expr,
-                mangle,
-            } => RuleResult::RateLimit {
-                rule_name: rule_name.to_string(),
-                requests: *requests,
-                window_secs: *window_secs,
-                key_expr: key_expr.clone(),
-                mangle: *mangle,
-                logged_headers,
-            },
-            Action::Credit {
-                credits,
-                period,
-                key_expr,
-                mangle,
-            } => RuleResult::Credit {
-                rule_name: rule_name.to_string(),
-                credits: *credits,
-                period: *period,
-                key_expr: key_expr.clone(),
-                mangle: *mangle,
-                logged_headers,
-            },
-            Action::RateLimitCredit {
-                requests,
-                window_secs,
-                rate_key_expr,
-                credits,
-                period,
-                credit_key_expr,
-                mangle,
-            } => RuleResult::RateLimitCredit {
-                rule_name: rule_name.to_string(),
-                requests: *requests,
-                window_secs: *window_secs,
-                rate_key_expr: rate_key_expr.clone(),
-                credits: *credits,
-                period: *period,
-                credit_key_expr: credit_key_expr.clone(),
-                mangle: *mangle,
-                logged_headers,
-            },
-        }
-    }
 }
 
 impl Default for RuleIndex {
@@ -397,7 +286,7 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("example.com", "/", Method::GET, &headers);
 
-        assert!(matches!(index.evaluate(&ctx), RuleResult::NoMatch));
+        assert!(index.evaluate(&ctx).is_none());
     }
 
     #[test]
@@ -416,21 +305,19 @@ mod tests {
 
         // GET request should match get-only rule
         let ctx = make_ctx("test.com", "/", Method::GET, &headers);
-        assert!(matches!(
-            index.evaluate(&ctx),
-            RuleResult::Pass { rule_name, .. } if rule_name == "get-only"
-        ));
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "get-only");
+        assert!(matches!(r.action, Action::Pass));
 
         // POST request should match post-only rule
         let ctx = make_ctx("test.com", "/", Method::POST, &headers);
-        assert!(matches!(
-            index.evaluate(&ctx),
-            RuleResult::Block { rule_name, .. } if rule_name == "post-only"
-        ));
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "post-only");
+        assert!(matches!(r.action, Action::Block));
 
         // DELETE request should not match
         let ctx = make_ctx("test.com", "/", Method::DELETE, &headers);
-        assert!(matches!(index.evaluate(&ctx), RuleResult::NoMatch));
+        assert!(index.evaluate(&ctx).is_none());
     }
 
     #[test]
@@ -446,10 +333,9 @@ mod tests {
         // Should match for any method
         for method in [Method::GET, Method::POST, Method::DELETE, Method::PUT] {
             let ctx = make_ctx("blocked.com", "/", method, &headers);
-            assert!(matches!(
-                index.evaluate(&ctx),
-                RuleResult::Block { rule_name, .. } if rule_name == "all-methods"
-            ));
+            let r = index.evaluate(&ctx).unwrap();
+            assert_eq!(r.rule_name, "all-methods");
+            assert!(matches!(r.action, Action::Block));
         }
     }
 
@@ -468,10 +354,9 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("test.com", "/", Method::GET, &headers);
 
-        assert!(matches!(
-            index.evaluate(&ctx),
-            RuleResult::Block { rule_name, .. } if rule_name == "first"
-        ));
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "first");
+        assert!(matches!(r.action, Action::Block));
     }
 
     #[test]
@@ -485,12 +370,15 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("x-auth".to_string(), "token".to_string());
         let ctx = make_ctx("test.com", "/", Method::GET, &headers);
-        assert!(matches!(index.evaluate(&ctx), RuleResult::Pass { .. }));
+        assert!(matches!(index.evaluate(&ctx).unwrap().action, Action::Pass));
 
         // Without header: should block
         let headers = HashMap::new();
         let ctx = make_ctx("test.com", "/", Method::GET, &headers);
-        assert!(matches!(index.evaluate(&ctx), RuleResult::Block { .. }));
+        assert!(matches!(
+            index.evaluate(&ctx).unwrap().action,
+            Action::Block
+        ));
     }
 
     #[test]
@@ -517,24 +405,21 @@ mod tests {
 
         // Health check should pass (rule 1)
         let ctx = make_ctx("api.example.com", "/health", Method::GET, &headers);
-        assert!(matches!(
-            index.evaluate(&ctx),
-            RuleResult::Pass { rule_name, .. } if rule_name == "allow-health"
-        ));
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "allow-health");
+        assert!(matches!(r.action, Action::Pass));
 
         // Payment should pass (rule 2)
         let ctx = make_ctx("api.example.com", "/payment", Method::POST, &headers);
-        assert!(matches!(
-            index.evaluate(&ctx),
-            RuleResult::Pass { rule_name, .. } if rule_name == "allow-payment"
-        ));
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "allow-payment");
+        assert!(matches!(r.action, Action::Pass));
 
         // Everything else should be blocked (rule 3)
         let ctx = make_ctx("api.example.com", "/users", Method::GET, &headers);
-        assert!(matches!(
-            index.evaluate(&ctx),
-            RuleResult::Block { rule_name, .. } if rule_name == "block-all"
-        ));
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "block-all");
+        assert!(matches!(r.action, Action::Block));
     }
 
     #[test]
@@ -662,20 +547,13 @@ mod tests {
         headers.insert("x-customer-id".to_string(), "cust-12345".to_string());
         let ctx = make_ctx("test.com", "/", Method::GET, &headers);
 
-        let result = index.evaluate(&ctx);
-        match result {
-            RuleResult::Pass {
-                rule_name,
-                logged_headers,
-            } => {
-                assert_eq!(rule_name, "check-auth");
-                assert_eq!(
-                    logged_headers.get("X-Customer-Id"),
-                    Some(&"cust-12345".to_string())
-                );
-            }
-            _ => panic!("Expected Pass result"),
-        }
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "check-auth");
+        assert!(matches!(r.action, Action::Pass));
+        assert_eq!(
+            r.logged_headers.get("X-Customer-Id"),
+            Some(&"cust-12345".to_string())
+        );
     }
 
     #[test]
@@ -695,21 +573,17 @@ mod tests {
         headers.insert("x-request-id".to_string(), "req-abc-123".to_string());
         let ctx = make_ctx("test.com", "/", Method::GET, &headers);
 
-        let result = index.evaluate(&ctx);
-        match result {
-            RuleResult::Pass { logged_headers, .. } => {
-                assert_eq!(logged_headers.len(), 2);
-                assert_eq!(
-                    logged_headers.get("X-Auth"),
-                    Some(&"bearer-token".to_string())
-                );
-                assert_eq!(
-                    logged_headers.get("X-Request-Id"),
-                    Some(&"req-abc-123".to_string())
-                );
-            }
-            _ => panic!("Expected Pass result"),
-        }
+        let r = index.evaluate(&ctx).unwrap();
+        assert!(matches!(r.action, Action::Pass));
+        assert_eq!(r.logged_headers.len(), 2);
+        assert_eq!(
+            r.logged_headers.get("X-Auth"),
+            Some(&"bearer-token".to_string())
+        );
+        assert_eq!(
+            r.logged_headers.get("X-Request-Id"),
+            Some(&"req-abc-123".to_string())
+        );
     }
 
     #[test]
@@ -724,16 +598,12 @@ mod tests {
         headers.insert("x-auth".to_string(), "secret".to_string());
         let ctx = make_ctx("test.com", "/", Method::GET, &headers);
 
-        let result = index.evaluate(&ctx);
-        match result {
-            RuleResult::Pass { logged_headers, .. } => {
-                assert!(
-                    logged_headers.is_empty(),
-                    "Value matches should not be logged"
-                );
-            }
-            _ => panic!("Expected Pass result"),
-        }
+        let r = index.evaluate(&ctx).unwrap();
+        assert!(matches!(r.action, Action::Pass));
+        assert!(
+            r.logged_headers.is_empty(),
+            "Value matches should not be logged"
+        );
     }
 
     #[test]
@@ -748,14 +618,10 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("test.com", "/", Method::GET, &headers);
 
-        let result = index.evaluate(&ctx);
-        match result {
-            RuleResult::Block { logged_headers, .. } => {
-                // Header not present, so logged_headers should be empty
-                assert!(logged_headers.is_empty());
-            }
-            _ => panic!("Expected Block result"),
-        }
+        let r = index.evaluate(&ctx).unwrap();
+        assert!(matches!(r.action, Action::Block));
+        // Header not present, so logged_headers should be empty
+        assert!(r.logged_headers.is_empty());
     }
 
     #[test]
@@ -773,12 +639,13 @@ mod tests {
         headers.insert("x-id".to_string(), "cust-123".to_string());
         let ctx = make_ctx("api.example.com", "/v1/data", Method::GET, &headers);
 
-        let result = index.evaluate(&ctx);
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "api-protected");
         assert!(
-            matches!(&result, RuleResult::RateLimitCredit { rule_name, requests, credits, .. }
-                if rule_name == "api-protected" && *requests == 100 && *credits == 1000),
-            "Expected RateLimitCredit result, got {:?}",
-            result
+            matches!(&r.action, Action::RateLimitCredit { requests, credits, .. }
+                if *requests == 100 && *credits == 1000),
+            "Expected RateLimitCredit action, got {:?}",
+            r.action
         );
     }
 
@@ -824,12 +691,12 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("api.example.com", "/v1/data", Method::GET, &headers);
 
-        let result = index.evaluate(&ctx);
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "rl-mangle");
         assert!(
-            matches!(&result, RuleResult::RateLimit { rule_name, mangle, .. }
-                if rule_name == "rl-mangle" && *mangle),
+            matches!(&r.action, Action::RateLimit { mangle, .. } if *mangle),
             "Expected RateLimit with mangle=true, got {:?}",
-            result
+            r.action
         );
     }
 
@@ -847,12 +714,12 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("api.example.com", "/v1/data", Method::GET, &headers);
 
-        let result = index.evaluate(&ctx);
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "credit-mangle");
         assert!(
-            matches!(&result, RuleResult::Credit { rule_name, mangle, .. }
-                if rule_name == "credit-mangle" && *mangle),
+            matches!(&r.action, Action::Credit { mangle, .. } if *mangle),
             "Expected Credit with mangle=true, got {:?}",
-            result
+            r.action
         );
     }
 
@@ -870,12 +737,12 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("api.example.com", "/v1/data", Method::GET, &headers);
 
-        let result = index.evaluate(&ctx);
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "combo-mangle");
         assert!(
-            matches!(&result, RuleResult::RateLimitCredit { rule_name, mangle, .. }
-                if rule_name == "combo-mangle" && *mangle),
+            matches!(&r.action, Action::RateLimitCredit { mangle, .. } if *mangle),
             "Expected RateLimitCredit with mangle=true, got {:?}",
-            result
+            r.action
         );
     }
 
@@ -889,12 +756,12 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("api.example.com", "/v1/data", Method::GET, &headers);
 
-        let result = index.evaluate(&ctx);
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "rl-only");
         assert!(
-            matches!(&result, RuleResult::RateLimit { rule_name, mangle, .. }
-                if rule_name == "rl-only" && !*mangle),
+            matches!(&r.action, Action::RateLimit { mangle, .. } if !*mangle),
             "Expected RateLimit with mangle=false, got {:?}",
-            result
+            r.action
         );
     }
 
@@ -917,29 +784,20 @@ mod tests {
 
         // GET /health should pass (rule 1)
         let ctx = make_ctx("example.com", "/health", Method::GET, &headers);
-        let result = index.evaluate(&ctx);
-        assert!(
-            matches!(&result, RuleResult::Pass { rule_name, .. } if rule_name == "allow-healthcheck"),
-            "Expected Pass from allow-healthcheck, got {:?}",
-            result
-        );
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "allow-healthcheck");
+        assert!(matches!(r.action, Action::Pass));
 
         // POST /health should be blocked (rule 1 requires GET)
         let ctx = make_ctx("example.com", "/health", Method::POST, &headers);
-        let result = index.evaluate(&ctx);
-        assert!(
-            matches!(&result, RuleResult::Block { rule_name, .. } if rule_name == "block-all"),
-            "Expected Block from block-all, got {:?}",
-            result
-        );
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "block-all");
+        assert!(matches!(r.action, Action::Block));
 
         // GET /other should be blocked
         let ctx = make_ctx("example.com", "/other", Method::GET, &headers);
-        let result = index.evaluate(&ctx);
-        assert!(
-            matches!(&result, RuleResult::Block { rule_name, .. } if rule_name == "block-all"),
-            "Expected Block from block-all, got {:?}",
-            result
-        );
+        let r = index.evaluate(&ctx).unwrap();
+        assert_eq!(r.rule_name, "block-all");
+        assert!(matches!(r.action, Action::Block));
     }
 }

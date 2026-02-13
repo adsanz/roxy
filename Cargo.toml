@@ -40,8 +40,8 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 http = "1"
 hyper = "1"
 
-# Base64 decoding for PEM certificates
-base64 = "0.22"
+# PEM certificate parsing
+pem = "3"
 
 # Time handling for certificate validity
 time = "0.3"

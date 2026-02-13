@@ -33,8 +33,8 @@ pub fn extract_ip_key(rule_name: &str, ctx: &EvalContext) -> String {
 /// Returns a placeholder for missing values instead of failing.
 fn extract_single(extractor: &KeyExtractor, ctx: &EvalContext) -> String {
     match extractor {
-        KeyExtractor::Host(_pattern) => ctx.host.to_string(),
-        KeyExtractor::Path(_pattern) => ctx.path.to_string(),
+        KeyExtractor::Host => ctx.host.to_string(),
+        KeyExtractor::Path => ctx.path.to_string(),
         KeyExtractor::Header(name) => ctx
             .headers
             .get(&name.to_lowercase())
@@ -73,7 +73,7 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("api.example.com", "/", &headers, None);
 
-        let key = extract_key(&KeyExpr::Single(KeyExtractor::Host(None)), &ctx);
+        let key = extract_key(&KeyExpr::Single(KeyExtractor::Host), &ctx);
         assert_eq!(key, "api.example.com");
     }
 
@@ -82,7 +82,7 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("example.com", "/api/v1/users", &headers, None);
 
-        let key = extract_key(&KeyExpr::Single(KeyExtractor::Path(None)), &ctx);
+        let key = extract_key(&KeyExpr::Single(KeyExtractor::Path), &ctx);
         assert_eq!(key, "/api/v1/users");
     }
 
@@ -128,8 +128,8 @@ mod tests {
 
         let key_expr = KeyExpr::Composite(vec![
             KeyExtractor::Header("X-Customer-Id".to_string()),
-            KeyExtractor::Path(None),
-            KeyExtractor::Host(None),
+            KeyExtractor::Path,
+            KeyExtractor::Host,
         ]);
 
         let key = extract_key(&key_expr, &ctx);
@@ -143,7 +143,7 @@ mod tests {
 
         let key_expr = KeyExpr::Composite(vec![
             KeyExtractor::Header("X-Customer-Id".to_string()),
-            KeyExtractor::Host(None),
+            KeyExtractor::Host,
         ]);
 
         // Should succeed with placeholder instead of failing

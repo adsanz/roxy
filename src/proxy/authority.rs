@@ -240,28 +240,8 @@ impl CertificateAuthority for RoxyAuthority {
 
 /// Parse a PEM-encoded certificate to DER format.
 fn pem_to_der(pem_str: &str) -> CertificateDer<'static> {
-    // Find the certificate block
-    let start_marker = "-----BEGIN CERTIFICATE-----";
-    let end_marker = "-----END CERTIFICATE-----";
-
-    let start = pem_str
-        .find(start_marker)
-        .expect("PEM start marker not found")
-        + start_marker.len();
-    let end = pem_str.find(end_marker).expect("PEM end marker not found");
-
-    // Extract base64 content and decode
-    let base64_content: String = pem_str[start..end]
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-
-    use base64::Engine;
-    let der_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&base64_content)
-        .expect("Failed to decode base64 certificate");
-
-    CertificateDer::from(der_bytes)
+    let parsed = pem::parse(pem_str).expect("Failed to parse PEM certificate");
+    CertificateDer::from(parsed.into_contents())
 }
 
 #[cfg(test)]

@@ -156,14 +156,14 @@ impl KeyExpr {
 /// Individual key extractor.
 #[derive(Debug, Clone)]
 pub enum KeyExtractor {
-    /// Extract from host
-    Host(Option<String>), // None = full host, Some = glob capture
+    /// Extract from host (full value)
+    Host,
 
     /// Extract from header value
     Header(String),
 
-    /// Extract from path
-    Path(Option<String>), // None = full path, Some = glob capture
+    /// Extract from path (full value)
+    Path,
 
     /// Client IP address
     ClientIp,
