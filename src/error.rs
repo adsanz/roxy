@@ -2,31 +2,9 @@
 //!
 //! Errors propagate upward through layers:
 //! - Lower layers define specific errors (ParseError, ConfigError)
-//! - Domain layer adds semantic meaning (RuleError)
-//! - Proxy layer converts RoxyError → HTTP status codes
+//! - Proxy layer converts errors → HTTP status codes
 
 use thiserror::Error;
-
-/// Top-level error type for Roxy.
-/// Used at module boundaries and in the proxy layer.
-/// 
-/// NOTE: Currently handlers return Hudsucker errors directly.
-/// This type is designed for future unified error handling.
-#[allow(dead_code)]
-#[derive(Debug, Error)]
-pub enum RoxyError {
-    #[error("Configuration error: {0}")]
-    Config(#[from] ConfigError),
-
-    #[error("Rule error: {0}")]
-    Rule(#[from] RuleError),
-
-    #[error("Rate limit error: {0}")]
-    RateLimit(#[from] RateLimitError),
-
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-}
 
 /// Configuration loading and parsing errors.
 #[derive(Debug, Error)]
@@ -45,49 +23,50 @@ pub enum ConfigError {
 }
 
 /// Rule DSL parsing errors.
+/// Each variant includes the rule name for easy identification in multi-rule configs.
 #[derive(Debug, Error)]
 pub enum ParseError {
-    #[error("Unexpected token at position {position}: expected {expected}, got '{actual}'")]
+    #[error("Rule '{rule_name}': unexpected input at position {position} — expected {expected}, got '{actual}'")]
     UnexpectedToken {
+        rule_name: String,
         position: usize,
         expected: String,
         actual: String,
     },
 
-    #[error("Empty expression")]
-    EmptyExpression,
+    #[error("Rule '{rule_name}': empty expression")]
+    EmptyExpression { rule_name: String },
 
-    #[error("Parse error: {0}")]
-    Nom(String),
-}
+    #[error("Rule '{rule_name}': invalid glob pattern '{pattern}' — {reason}")]
+    InvalidGlob {
+        rule_name: String,
+        pattern: String,
+        reason: String,
+    },
 
-/// Rule evaluation errors (semantic, not syntax).
-#[allow(dead_code)]
-#[derive(Debug, Error)]
-pub enum RuleError {
-    #[error("Request blocked by rule: {rule_name}")]
-    Blocked { rule_name: String },
-}
+    #[error("Rule '{rule_name}': unknown HTTP method '{method}'")]
+    InvalidMethod {
+        rule_name: String,
+        method: String,
+    },
 
-/// Rate limiting errors.
-#[derive(Debug, Error)]
-pub enum RateLimitError {
-    #[error("Failed to extract rate limit key: {0}")]
-    KeyExtraction(String),
-}
+    #[error("Rule '{rule_name}': invalid action combination — {detail}")]
+    InvalidActionCombination {
+        rule_name: String,
+        detail: String,
+    },
 
-#[allow(dead_code)]
-impl RoxyError {
-    /// Convert error to HTTP status code for response.
-    /// This is the single point where errors become HTTP semantics.
-    pub fn status_code(&self) -> u16 {
-        match self {
-            RoxyError::Config(_) => 500,
-            RoxyError::Rule(RuleError::Blocked { .. }) => 403,
-            RoxyError::RateLimit(_) => 429,
-            RoxyError::Io(_) => 502,
-        }
-    }
+    #[error("Rule '{rule_name}': {detail}")]
+    InvalidValue {
+        rule_name: String,
+        detail: String,
+    },
+
+    #[error("Rule '{rule_name}': {detail}")]
+    Other {
+        rule_name: String,
+        detail: String,
+    },
 }
 
 #[cfg(test)]
@@ -95,22 +74,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_blocked_rule_returns_403() {
-        let err = RoxyError::Rule(RuleError::Blocked {
-            rule_name: "test-rule".to_string(),
-        });
-        assert_eq!(err.status_code(), 403);
+    fn test_parse_error_messages() {
+        let err = ParseError::InvalidGlob {
+            rule_name: "block-internal".to_string(),
+            pattern: "[invalid".to_string(),
+            reason: "unclosed character class".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("block-internal"));
+        assert!(msg.contains("[invalid"));
     }
 
     #[test]
-    fn test_rate_limit_returns_429() {
-        let err = RoxyError::RateLimit(RateLimitError::KeyExtraction("test".to_string()));
-        assert_eq!(err.status_code(), 429);
+    fn test_invalid_method_message() {
+        let err = ParseError::InvalidMethod {
+            rule_name: "my-rule".to_string(),
+            method: "FOOBAR".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("my-rule"));
+        assert!(msg.contains("FOOBAR"));
     }
 
     #[test]
-    fn test_config_error_returns_500() {
-        let err = RoxyError::Config(ConfigError::Invalid("test".to_string()));
-        assert_eq!(err.status_code(), 500);
+    fn test_invalid_action_combo_message() {
+        let err = ParseError::InvalidActionCombination {
+            rule_name: "test".to_string(),
+            detail: "cannot combine 'block' with 'credit'".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("cannot combine"));
+    }
+
+    #[test]
+    fn test_config_error_display() {
+        let err = ConfigError::Invalid("test".to_string());
+        assert!(err.to_string().contains("Invalid configuration"));
     }
 }

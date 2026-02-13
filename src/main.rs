@@ -160,8 +160,11 @@ async fn main() {
     // Build rule index
     let rules = match RuleIndex::from_config(&config.rules) {
         Ok(r) => Arc::new(r),
-        Err(e) => {
-            error!(target: "proxy", error = %e, "Failed to parse rules");
+        Err(errors) => {
+            for e in &errors {
+                error!(target: "proxy", error = %e, "Rule parse error");
+            }
+            error!(target: "proxy", count = errors.len(), "Failed to parse rules — fix all errors above");
             std::process::exit(1);
         }
     };
@@ -171,6 +174,12 @@ async fn main() {
         rule_count = rules.rule_count(),
         "Loaded rules"
     );
+
+    // Warn about unreachable rules (ternary rules shadow subsequent rules)
+    rules.warn_unreachable();
+
+    // Warn about rules with duplicate conditions (only first can ever match)
+    rules.warn_duplicate_conditions();
 
     // Create rate limiter
     let cleanup_interval = config
@@ -223,6 +232,22 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+
+        // Cross-validate: soft_limit must be less than budget
+        if let Some(soft_limit) = credit_cfg.soft_limit
+            && soft_limit >= budget
+        {
+            error!(
+                target: "proxy",
+                rule = %credit_cfg.rule,
+                soft_limit = soft_limit,
+                budget = budget,
+                "Credit soft_limit ({}) must be less than budget ({})",
+                soft_limit,
+                budget
+            );
+            std::process::exit(1);
+        }
 
         credit_manager.register_rule(
             credit_cfg.rule.clone(),

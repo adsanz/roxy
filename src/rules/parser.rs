@@ -19,17 +19,67 @@ use nom::{
 use crate::error::ParseError;
 use crate::rules::ast::*;
 
+/// Custom nom error that carries a descriptive message for later conversion
+/// to a rich `ParseError` at the `parse_rule()` boundary.
+#[derive(Debug)]
+struct RuleParseError<'a> {
+    input: &'a str,
+    kind: RuleParseErrorKind,
+}
+
+#[derive(Debug)]
+enum RuleParseErrorKind {
+    /// Invalid glob pattern with the pattern string and the reason
+    InvalidGlob { pattern: String, reason: String },
+    /// Invalid HTTP method with the method string
+    InvalidMethod { method: String },
+    /// Invalid action combination with a description
+    InvalidActionCombination { detail: String },
+    /// Invalid value (e.g. rate_limit(0/s, ...))
+    InvalidValue { detail: String },
+    /// Generic nom error (fallback)
+    Nom(#[allow(dead_code)] nom::error::ErrorKind),
+}
+
+impl<'a> nom::error::ParseError<&'a str> for RuleParseError<'a> {
+    fn from_error_kind(input: &'a str, kind: nom::error::ErrorKind) -> Self {
+        Self {
+            input,
+            kind: RuleParseErrorKind::Nom(kind),
+        }
+    }
+
+    fn append(_input: &'a str, _kind: nom::error::ErrorKind, other: Self) -> Self {
+        other
+    }
+}
+
+impl<'a, E> nom::error::FromExternalError<&'a str, E> for RuleParseError<'a> {
+    fn from_external_error(input: &'a str, kind: nom::error::ErrorKind, _e: E) -> Self {
+        Self {
+            input,
+            kind: RuleParseErrorKind::Nom(kind),
+        }
+    }
+}
+
+/// Internal IResult type using our custom error
+type RResult<'a, O> = IResult<&'a str, O, RuleParseError<'a>>;
+
 /// Parse a complete rule string into a CompiledRule.
 pub fn parse_rule(name: &str, input: &str) -> Result<CompiledRule, ParseError> {
     let input = input.trim();
     if input.is_empty() {
-        return Err(ParseError::EmptyExpression);
+        return Err(ParseError::EmptyExpression {
+            rule_name: name.to_string(),
+        });
     }
 
     match parse_rule_internal(input) {
         Ok((remaining, (condition, action, else_action))) => {
             if !remaining.trim().is_empty() {
                 return Err(ParseError::UnexpectedToken {
+                    rule_name: name.to_string(),
                     position: input.len() - remaining.len(),
                     expected: "end of input".to_string(),
                     actual: remaining.to_string(),
@@ -42,12 +92,55 @@ pub fn parse_rule(name: &str, input: &str) -> Result<CompiledRule, ParseError> {
                 else_action,
             ))
         }
-        Err(e) => Err(ParseError::Nom(format!("{:?}", e))),
+        Err(nom::Err::Failure(e) | nom::Err::Error(e)) => {
+            match e.kind {
+                RuleParseErrorKind::InvalidGlob { pattern, reason } => {
+                    Err(ParseError::InvalidGlob {
+                        rule_name: name.to_string(),
+                        pattern,
+                        reason,
+                    })
+                }
+                RuleParseErrorKind::InvalidMethod { method } => Err(ParseError::InvalidMethod {
+                    rule_name: name.to_string(),
+                    method,
+                }),
+                RuleParseErrorKind::InvalidActionCombination { detail } => {
+                    Err(ParseError::InvalidActionCombination {
+                        rule_name: name.to_string(),
+                        detail,
+                    })
+                }
+                RuleParseErrorKind::InvalidValue { detail } => Err(ParseError::InvalidValue {
+                    rule_name: name.to_string(),
+                    detail,
+                }),
+                RuleParseErrorKind::Nom(_) => {
+                    // Derive a human-readable message from remaining input context
+                    let position = input.len() - e.input.len();
+                    let actual = if e.input.len() > 30 {
+                        format!("{}...", &e.input[..30])
+                    } else {
+                        e.input.to_string()
+                    };
+                    Err(ParseError::UnexpectedToken {
+                        rule_name: name.to_string(),
+                        position,
+                        expected: "valid expression or action".to_string(),
+                        actual,
+                    })
+                }
+            }
+        }
+        Err(nom::Err::Incomplete(_)) => Err(ParseError::Other {
+            rule_name: name.to_string(),
+            detail: "incomplete input".to_string(),
+        }),
     }
 }
 
 /// Internal parser for rule: condition = action [: else_action]
-fn parse_rule_internal(input: &str) -> IResult<&str, (Expr, Action, Option<Action>)> {
+fn parse_rule_internal(input: &str) -> RResult<'_, (Expr, Action, Option<Action>)> {
     let (input, condition) = parse_expr(input)?;
     let (input, _) = ws(char('='))(input)?;
     let (input, action) = parse_action(input)?;
@@ -56,12 +149,12 @@ fn parse_rule_internal(input: &str) -> IResult<&str, (Expr, Action, Option<Actio
 }
 
 /// Parse an expression (handles OR at lowest precedence)
-fn parse_expr(input: &str) -> IResult<&str, Expr> {
+fn parse_expr(input: &str) -> RResult<'_, Expr> {
     parse_or_expr(input)
 }
 
 /// Parse OR expression: and_expr (|| and_expr)*
-fn parse_or_expr(input: &str) -> IResult<&str, Expr> {
+fn parse_or_expr(input: &str) -> RResult<'_, Expr> {
     let (input, first) = parse_and_expr(input)?;
     let (input, rest) = nom::multi::many0(preceded(ws(tag("||")), parse_and_expr))(input)?;
 
@@ -73,7 +166,7 @@ fn parse_or_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 /// Parse AND expression: unary_expr (&& unary_expr)*
-fn parse_and_expr(input: &str) -> IResult<&str, Expr> {
+fn parse_and_expr(input: &str) -> RResult<'_, Expr> {
     let (input, first) = parse_unary_expr(input)?;
     let (input, rest) = nom::multi::many0(preceded(ws(tag("&&")), parse_unary_expr))(input)?;
 
@@ -85,7 +178,7 @@ fn parse_and_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 /// Parse unary expression: !primary | primary
-fn parse_unary_expr(input: &str) -> IResult<&str, Expr> {
+fn parse_unary_expr(input: &str) -> RResult<'_, Expr> {
     alt((
         map(preceded(ws(char('!')), parse_unary_expr), |e| {
             Expr::Not(Box::new(e))
@@ -95,7 +188,7 @@ fn parse_unary_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 /// Parse primary expression: (expr) | function_call
-fn parse_primary_expr(input: &str) -> IResult<&str, Expr> {
+fn parse_primary_expr(input: &str) -> RResult<'_, Expr> {
     alt((
         delimited(ws(char('(')), parse_expr, ws(char(')'))),
         parse_function_call,
@@ -103,36 +196,52 @@ fn parse_primary_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 /// Parse function call: host(...) | path(...) | method(...) | header(...)
-fn parse_function_call(input: &str) -> IResult<&str, Expr> {
+fn parse_function_call(input: &str) -> RResult<'_, Expr> {
     alt((parse_host, parse_path, parse_method, parse_header))(input)
 }
 
 /// Parse host("pattern")
-fn parse_host(input: &str) -> IResult<&str, Expr> {
+fn parse_host(input: &str) -> RResult<'_, Expr> {
     let (input, _) = ws(tag_no_case("host"))(input)?;
     let (input, pattern) = delimited(ws(char('(')), parse_string_arg, ws(char(')')))(input)?;
 
     let glob = Glob::new(&pattern)
-        .map_err(|_| nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))?
+        .map_err(|e| {
+            nom::Err::Failure(RuleParseError {
+                input,
+                kind: RuleParseErrorKind::InvalidGlob {
+                    pattern: pattern.clone(),
+                    reason: e.to_string(),
+                },
+            })
+        })?
         .compile_matcher();
 
     Ok((input, Expr::Host(glob)))
 }
 
 /// Parse path("pattern")
-fn parse_path(input: &str) -> IResult<&str, Expr> {
+fn parse_path(input: &str) -> RResult<'_, Expr> {
     let (input, _) = ws(tag_no_case("path"))(input)?;
     let (input, pattern) = delimited(ws(char('(')), parse_string_arg, ws(char(')')))(input)?;
 
     let glob = Glob::new(&pattern)
-        .map_err(|_| nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))?
+        .map_err(|e| {
+            nom::Err::Failure(RuleParseError {
+                input,
+                kind: RuleParseErrorKind::InvalidGlob {
+                    pattern: pattern.clone(),
+                    reason: e.to_string(),
+                },
+            })
+        })?
         .compile_matcher();
 
     Ok((input, Expr::Path(glob)))
 }
 
 /// Parse method(GET|POST|...)
-fn parse_method(input: &str) -> IResult<&str, Expr> {
+fn parse_method(input: &str) -> RResult<'_, Expr> {
     let (input, _) = ws(tag_no_case("method"))(input)?;
     let (input, method_str) = delimited(
         ws(char('(')),
@@ -141,14 +250,19 @@ fn parse_method(input: &str) -> IResult<&str, Expr> {
     )(input)?;
 
     let method = Method::from_bytes(method_str.to_uppercase().as_bytes()).map_err(|_| {
-        nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Tag))
+        nom::Err::Failure(RuleParseError {
+            input,
+            kind: RuleParseErrorKind::InvalidMethod {
+                method: method_str.to_string(),
+            },
+        })
     })?;
 
     Ok((input, Expr::Method(method)))
 }
 
 /// Parse header("Name") or header("Name:value") or header("Name~pattern")
-fn parse_header(input: &str) -> IResult<&str, Expr> {
+fn parse_header(input: &str) -> RResult<'_, Expr> {
     let (input, _) = ws(tag_no_case("header"))(input)?;
     let (input, arg) = delimited(ws(char('(')), parse_string_arg, ws(char(')')))(input)?;
 
@@ -159,8 +273,14 @@ fn parse_header(input: &str) -> IResult<&str, Expr> {
     } else if let Some(pos) = arg.find('~') {
         let (n, v) = arg.split_at(pos);
         let glob = Glob::new(&v[1..])
-            .map_err(|_| {
-                nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Tag))
+            .map_err(|e| {
+                nom::Err::Failure(RuleParseError {
+                    input,
+                    kind: RuleParseErrorKind::InvalidGlob {
+                        pattern: v[1..].to_string(),
+                        reason: e.to_string(),
+                    },
+                })
             })?
             .compile_matcher();
         (n.to_string(), Some(HeaderMatch::Glob(glob)))
@@ -172,7 +292,7 @@ fn parse_header(input: &str) -> IResult<&str, Expr> {
 }
 
 /// Parse action: single action or composite (action + action)
-fn parse_action(input: &str) -> IResult<&str, Action> {
+fn parse_action(input: &str) -> RResult<'_, Action> {
     let (remaining, first) = parse_single_action(input)?;
 
     // Try to parse additional actions after '+'
@@ -196,7 +316,12 @@ fn parse_action(input: &str) -> IResult<&str, Action> {
 ///   - rate_limit + mangle (or reverse) → RateLimit { mangle: true }
 ///   - credit + mangle (or reverse) → Credit { mangle: true }
 ///   - rate_limit + credit + mangle (any order) → RateLimitCredit { mangle: true }
-fn combine_actions(a: Action, b: Action, c: Option<Action>, input: &str) -> IResult<&str, Action> {
+fn combine_actions<'a>(
+    a: Action,
+    b: Action,
+    c: Option<Action>,
+    input: &'a str,
+) -> RResult<'a, Action> {
     // Collect actions into categorized slots
     let actions: Vec<Action> = match c {
         Some(third) => vec![a, b, third],
@@ -207,7 +332,7 @@ fn combine_actions(a: Action, b: Action, c: Option<Action>, input: &str) -> IRes
     let mut credit: Option<(u64, CreditPeriod, KeyExpr)> = None;
     let mut has_mangle = false;
 
-    for action in actions {
+    for action in &actions {
         match action {
             Action::RateLimit {
                 requests,
@@ -216,12 +341,14 @@ fn combine_actions(a: Action, b: Action, c: Option<Action>, input: &str) -> IRes
                 ..
             } => {
                 if rate_limit.is_some() {
-                    return Err(nom::Err::Failure(nom::error::Error::new(
+                    return Err(nom::Err::Failure(RuleParseError {
                         input,
-                        nom::error::ErrorKind::Tag,
-                    )));
+                        kind: RuleParseErrorKind::InvalidActionCombination {
+                            detail: "duplicate 'rate_limit' in composite action".to_string(),
+                        },
+                    }));
                 }
-                rate_limit = Some((requests, window_secs, key_expr));
+                rate_limit = Some((*requests, *window_secs, key_expr.clone()));
             }
             Action::Credit {
                 credits,
@@ -230,28 +357,41 @@ fn combine_actions(a: Action, b: Action, c: Option<Action>, input: &str) -> IRes
                 ..
             } => {
                 if credit.is_some() {
-                    return Err(nom::Err::Failure(nom::error::Error::new(
+                    return Err(nom::Err::Failure(RuleParseError {
                         input,
-                        nom::error::ErrorKind::Tag,
-                    )));
+                        kind: RuleParseErrorKind::InvalidActionCombination {
+                            detail: "duplicate 'credit' in composite action".to_string(),
+                        },
+                    }));
                 }
-                credit = Some((credits, period, key_expr));
+                credit = Some((*credits, *period, key_expr.clone()));
             }
             Action::Mangle => {
                 if has_mangle {
-                    return Err(nom::Err::Failure(nom::error::Error::new(
+                    return Err(nom::Err::Failure(RuleParseError {
                         input,
-                        nom::error::ErrorKind::Tag,
-                    )));
+                        kind: RuleParseErrorKind::InvalidActionCombination {
+                            detail: "duplicate 'mangle' in composite action".to_string(),
+                        },
+                    }));
                 }
                 has_mangle = true;
             }
-            // block, pass, or other invalid combos
-            _ => {
-                return Err(nom::Err::Failure(nom::error::Error::new(
+            other => {
+                let action_name = match other {
+                    Action::Block => "block",
+                    Action::Pass => "pass",
+                    _ => "unknown",
+                };
+                return Err(nom::Err::Failure(RuleParseError {
                     input,
-                    nom::error::ErrorKind::Tag,
-                )));
+                    kind: RuleParseErrorKind::InvalidActionCombination {
+                        detail: format!(
+                            "cannot combine '{}' with other actions — only rate_limit, credit, and mangle can be combined",
+                            action_name
+                        ),
+                    },
+                }));
             }
         }
     }
@@ -295,15 +435,17 @@ fn combine_actions(a: Action, b: Action, c: Option<Action>, input: &str) -> IRes
             },
         )),
         // Any other combo is invalid
-        _ => Err(nom::Err::Failure(nom::error::Error::new(
+        _ => Err(nom::Err::Failure(RuleParseError {
             input,
-            nom::error::ErrorKind::Tag,
-        ))),
+            kind: RuleParseErrorKind::InvalidActionCombination {
+                detail: "unsupported action combination".to_string(),
+            },
+        })),
     }
 }
 
 /// Parse a single action: block | pass | mangle | rate_limit(...) | credit(...)
-fn parse_single_action(input: &str) -> IResult<&str, Action> {
+fn parse_single_action(input: &str) -> RResult<'_, Action> {
     alt((
         value(Action::Block, ws(tag_no_case("block"))),
         value(Action::Pass, ws(tag_no_case("pass"))),
@@ -314,7 +456,7 @@ fn parse_single_action(input: &str) -> IResult<&str, Action> {
 }
 
 /// Parse rate_limit(100/s, key_expr)
-fn parse_rate_limit_action(input: &str) -> IResult<&str, Action> {
+fn parse_rate_limit_action(input: &str) -> RResult<'_, Action> {
     let (input, _) = ws(tag_no_case("rate_limit"))(input)?;
     let (input, _) = ws(char('('))(input)?;
 
@@ -322,6 +464,15 @@ fn parse_rate_limit_action(input: &str) -> IResult<&str, Action> {
     let (input, requests) = map_res(digit1, |s: &str| s.parse::<u64>())(input)?;
     let (input, _) = char('/')(input)?;
     let (input, unit) = one_of("smh")(input)?;
+
+    if requests == 0 {
+        return Err(nom::Err::Failure(RuleParseError {
+            input,
+            kind: RuleParseErrorKind::InvalidValue {
+                detail: "rate_limit requests must be > 0".to_string(),
+            },
+        }));
+    }
 
     let window_secs = match unit {
         's' => 1,
@@ -347,7 +498,7 @@ fn parse_rate_limit_action(input: &str) -> IResult<&str, Action> {
 }
 
 /// Parse credit(1000/d, key_expr)
-fn parse_credit_action(input: &str) -> IResult<&str, Action> {
+fn parse_credit_action(input: &str) -> RResult<'_, Action> {
     let (input, _) = ws(tag_no_case("credit"))(input)?;
     let (input, _) = ws(char('('))(input)?;
 
@@ -355,6 +506,15 @@ fn parse_credit_action(input: &str) -> IResult<&str, Action> {
     let (input, credits) = map_res(digit1, |s: &str| s.parse::<u64>())(input)?;
     let (input, _) = char('/')(input)?;
     let (input, period_char) = one_of("dwM")(input)?;
+
+    if credits == 0 {
+        return Err(nom::Err::Failure(RuleParseError {
+            input,
+            kind: RuleParseErrorKind::InvalidValue {
+                detail: "credit budget must be > 0".to_string(),
+            },
+        }));
+    }
 
     let period = match period_char {
         'd' => CreditPeriod::Day,
@@ -380,7 +540,7 @@ fn parse_credit_action(input: &str) -> IResult<&str, Action> {
 }
 
 /// Parse key expression: extractor or extractor + extractor + ...
-fn parse_key_expr(input: &str) -> IResult<&str, KeyExpr> {
+fn parse_key_expr(input: &str) -> RResult<'_, KeyExpr> {
     let (input, first) = parse_key_extractor(input)?;
     let (input, rest) = nom::multi::many0(preceded(ws(char('+')), parse_key_extractor))(input)?;
 
@@ -394,7 +554,7 @@ fn parse_key_expr(input: &str) -> IResult<&str, KeyExpr> {
 }
 
 /// Parse single key extractor: host(*) | header(Name) | path(*) | ip
-fn parse_key_extractor(input: &str) -> IResult<&str, KeyExtractor> {
+fn parse_key_extractor(input: &str) -> RResult<'_, KeyExtractor> {
     alt((
         parse_key_host,
         parse_key_header,
@@ -404,33 +564,33 @@ fn parse_key_extractor(input: &str) -> IResult<&str, KeyExtractor> {
 }
 
 /// Parse host key extractor
-fn parse_key_host(input: &str) -> IResult<&str, KeyExtractor> {
+fn parse_key_host(input: &str) -> RResult<'_, KeyExtractor> {
     let (input, _) = ws(tag_no_case("host"))(input)?;
     let (input, pattern) = delimited(ws(char('(')), parse_key_pattern, ws(char(')')))(input)?;
     Ok((input, KeyExtractor::Host(pattern)))
 }
 
 /// Parse header key extractor
-fn parse_key_header(input: &str) -> IResult<&str, KeyExtractor> {
+fn parse_key_header(input: &str) -> RResult<'_, KeyExtractor> {
     let (input, _) = ws(tag_no_case("header"))(input)?;
     let (input, name) = delimited(ws(char('(')), parse_identifier, ws(char(')')))(input)?;
     Ok((input, KeyExtractor::Header(name.to_string())))
 }
 
 /// Parse path key extractor
-fn parse_key_path(input: &str) -> IResult<&str, KeyExtractor> {
+fn parse_key_path(input: &str) -> RResult<'_, KeyExtractor> {
     let (input, _) = ws(tag_no_case("path"))(input)?;
     let (input, pattern) = delimited(ws(char('(')), parse_key_pattern, ws(char(')')))(input)?;
     Ok((input, KeyExtractor::Path(pattern)))
 }
 
 /// Parse key pattern: * (full value) or a specific pattern
-fn parse_key_pattern(input: &str) -> IResult<&str, Option<String>> {
+fn parse_key_pattern(input: &str) -> RResult<'_, Option<String>> {
     alt((value(None, ws(char('*'))), map(parse_string_arg, Some)))(input)
 }
 
 /// Parse a string argument (quoted or unquoted)
-fn parse_string_arg(input: &str) -> IResult<&str, String> {
+fn parse_string_arg(input: &str) -> RResult<'_, String> {
     alt((
         // Double-quoted string
         map(
@@ -448,14 +608,14 @@ fn parse_string_arg(input: &str) -> IResult<&str, String> {
 }
 
 /// Parse an identifier (alphanumeric, -, _, ., *, /)
-fn parse_identifier(input: &str) -> IResult<&str, &str> {
+fn parse_identifier(input: &str) -> RResult<'_, &str> {
     take_while1(|c: char| c.is_alphanumeric() || "-_.*/?".contains(c))(input)
 }
 
 /// Wrap a parser to consume surrounding whitespace
-fn ws<'a, F, O>(inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
+fn ws<'a, F, O>(inner: F) -> impl FnMut(&'a str) -> RResult<'a, O>
 where
-    F: FnMut(&'a str) -> IResult<&'a str, O>,
+    F: FnMut(&'a str) -> RResult<'a, O>,
 {
     delimited(multispace0, inner, multispace0)
 }
@@ -907,5 +1067,127 @@ mod tests {
         // mangle + mangle is not valid
         let result = parse_rule("test", r#"host("api.*") = mangle + mangle"#);
         assert!(result.is_err());
+    }
+
+    // === New tests for enriched error messages ===
+
+    #[test]
+    fn test_error_includes_rule_name() {
+        let result = parse_rule("my-fancy-rule", "");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my-fancy-rule"),
+            "Error should contain rule name: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_empty_expression_error_variant() {
+        let result = parse_rule("empty-rule", "   ");
+        match result {
+            Err(ParseError::EmptyExpression { rule_name }) => {
+                assert_eq!(rule_name, "empty-rule");
+            }
+            other => panic!("Expected EmptyExpression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unexpected_token_includes_position() {
+        let result = parse_rule("trailing", r#"host("*.com") = block EXTRA"#);
+        match result {
+            Err(ParseError::UnexpectedToken {
+                rule_name,
+                position,
+                ..
+            }) => {
+                assert_eq!(rule_name, "trailing");
+                assert!(position > 0);
+            }
+            other => panic!("Expected UnexpectedToken, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_zero_rate_limit_rejected() {
+        let result = parse_rule("zero-rate", r#"host("*") = rate_limit(0/s, ip)"#);
+        match result {
+            Err(ParseError::InvalidValue { rule_name, detail }) => {
+                assert_eq!(rule_name, "zero-rate");
+                assert!(
+                    detail.contains("rate_limit"),
+                    "Detail should mention rate_limit: {}",
+                    detail
+                );
+            }
+            other => panic!("Expected InvalidValue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_zero_credit_rejected() {
+        let result = parse_rule("zero-credit", r#"host("*") = credit(0/d, ip)"#);
+        match result {
+            Err(ParseError::InvalidValue { rule_name, detail }) => {
+                assert_eq!(rule_name, "zero-credit");
+                assert!(
+                    detail.contains("credit"),
+                    "Detail should mention credit: {}",
+                    detail
+                );
+            }
+            other => panic!("Expected InvalidValue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_invalid_glob_error() {
+        let result = parse_rule("bad-glob", r#"host("[invalid") = block"#);
+        match result {
+            Err(ParseError::InvalidGlob {
+                rule_name, pattern, ..
+            }) => {
+                assert_eq!(rule_name, "bad-glob");
+                assert_eq!(pattern, "[invalid");
+            }
+            other => panic!("Expected InvalidGlob, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_invalid_action_combo_error() {
+        let result = parse_rule("bad-combo", r#"host("*") = block + credit(100/d, ip)"#);
+        match result {
+            Err(ParseError::InvalidActionCombination { rule_name, detail }) => {
+                assert_eq!(rule_name, "bad-combo");
+                assert!(
+                    detail.contains("block"),
+                    "Detail should mention 'block': {}",
+                    detail
+                );
+            }
+            other => panic!("Expected InvalidActionCombination, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_duplicate_rate_limit_combo_error() {
+        let result = parse_rule(
+            "dup-rl",
+            r#"host("*") = rate_limit(10/s, ip) + rate_limit(20/s, ip)"#,
+        );
+        match result {
+            Err(ParseError::InvalidActionCombination { rule_name, detail }) => {
+                assert_eq!(rule_name, "dup-rl");
+                assert!(
+                    detail.contains("duplicate"),
+                    "Detail should mention duplicate: {}",
+                    detail
+                );
+            }
+            other => panic!("Expected InvalidActionCombination, got {:?}", other),
+        }
     }
 }

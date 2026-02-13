@@ -132,7 +132,7 @@ impl RoxyHandler {
         window_secs: u64,
         ctx: &EvalContext,
     ) -> RateLimitResult {
-        let key = extract_key(key_expr, ctx).unwrap_or_else(|_| "__fallback__".to_string());
+        let key = extract_key(key_expr, ctx);
         self.rate_limiter.check(&key, requests, window_secs)
     }
 
@@ -161,7 +161,7 @@ impl RoxyHandler {
             .header("Content-Type", "text/plain")
             .header("Content-Length", message.len())
             .body(Body::from(message.to_string()))
-            .unwrap()
+            .unwrap_or_else(|_| Response::new(Body::from("Internal proxy error")))
     }
 
     /// Create a rate limit response with Retry-After header.
@@ -173,7 +173,7 @@ impl RoxyHandler {
             .header("Content-Length", message.len())
             .header("Retry-After", retry_after_secs.to_string())
             .body(Body::from(message.to_string()))
-            .unwrap()
+            .unwrap_or_else(|_| Response::new(Body::from("Rate limit exceeded")))
     }
 
     /// Create a credit exhaustion response with custom message.
@@ -184,7 +184,7 @@ impl RoxyHandler {
             .header("Content-Length", message.len())
             .header("Retry-After", retry_after_secs.to_string())
             .body(Body::from(message.to_string()))
-            .unwrap()
+            .unwrap_or_else(|_| Response::new(Body::from("Credit exhausted")))
     }
 
     /// Compute progressive delay for rate limiting when a throttle config exists.
@@ -358,8 +358,7 @@ impl HttpHandler for RoxyHandler {
                 mangle,
                 logged_headers,
             } => {
-                let key = extract_key(&key_expr, &eval_ctx)
-                    .unwrap_or_else(|_| "__fallback__".to_string());
+                let key = extract_key(&key_expr, &eval_ctx);
                 let result = self.credit_manager.check(&rule_name, &key);
                 match result {
                     CreditResult::Allowed { remaining } => {
@@ -454,8 +453,7 @@ impl HttpHandler for RoxyHandler {
                     }
                     RateLimitResult::Allowed { remaining } => {
                         // Step 2: Credit check (budget enforcement)
-                        let credit_key = extract_key(&credit_key_expr, &eval_ctx)
-                            .unwrap_or_else(|_| "__fallback__".to_string());
+                        let credit_key = extract_key(&credit_key_expr, &eval_ctx);
                         let credit_result = self.credit_manager.check(&rule_name, &credit_key);
                         match credit_result {
                             CreditResult::Exhausted {

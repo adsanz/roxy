@@ -232,6 +232,34 @@ impl Expr {
         }
     }
 
+    /// Produce a canonical string representation of this expression.
+    /// Used for detecting duplicate conditions across rules.
+    pub fn condition_signature(&self) -> String {
+        match self {
+            Expr::Host(glob) => format!("host(\"{}\")", glob.glob().glob()),
+            Expr::Path(glob) => format!("path(\"{}\")", glob.glob().glob()),
+            Expr::Method(m) => format!("method({})", m),
+            Expr::Header { name, value } => match value {
+                None => format!("header(\"{}\")", name),
+                Some(HeaderMatch::Exact(v)) => format!("header(\"{}:{}\")", name, v),
+                Some(HeaderMatch::Glob(g)) => {
+                    format!("header(\"{}~{}\")", name, g.glob().glob())
+                }
+            },
+            Expr::Not(inner) => format!("!{}", inner.condition_signature()),
+            Expr::And(left, right) => format!(
+                "({} && {})",
+                left.condition_signature(),
+                right.condition_signature()
+            ),
+            Expr::Or(left, right) => format!(
+                "({} || {})",
+                left.condition_signature(),
+                right.condition_signature()
+            ),
+        }
+    }
+
     /// Evaluate expression against request data.
     pub fn evaluate(&self, ctx: &EvalContext) -> bool {
         match self {
@@ -517,5 +545,53 @@ mod tests {
             None,
         );
         assert_eq!(rule3.indexed_method, None);
+    }
+
+    #[test]
+    fn test_condition_signature_simple() {
+        let expr = Expr::Host(make_glob("*.example.com"));
+        assert_eq!(expr.condition_signature(), r#"host("*.example.com")"#);
+    }
+
+    #[test]
+    fn test_condition_signature_and_or() {
+        let expr = Expr::And(
+            Box::new(Expr::Host(make_glob("*.com"))),
+            Box::new(Expr::Or(
+                Box::new(Expr::Method(Method::GET)),
+                Box::new(Expr::Method(Method::POST)),
+            )),
+        );
+        let sig = expr.condition_signature();
+        assert_eq!(sig, r#"(host("*.com") && (method(GET) || method(POST)))"#);
+    }
+
+    #[test]
+    fn test_condition_signature_not() {
+        let expr = Expr::Not(Box::new(Expr::Header {
+            name: "X-Auth".to_string(),
+            value: None,
+        }));
+        assert_eq!(expr.condition_signature(), r#"!header("X-Auth")"#);
+    }
+
+    #[test]
+    fn test_identical_conditions_same_signature() {
+        let a = Expr::And(
+            Box::new(Expr::Host(make_glob("api.*"))),
+            Box::new(Expr::Path(make_glob("/v1/*"))),
+        );
+        let b = Expr::And(
+            Box::new(Expr::Host(make_glob("api.*"))),
+            Box::new(Expr::Path(make_glob("/v1/*"))),
+        );
+        assert_eq!(a.condition_signature(), b.condition_signature());
+    }
+
+    #[test]
+    fn test_different_conditions_different_signature() {
+        let a = Expr::Host(make_glob("api.*"));
+        let b = Expr::Host(make_glob("web.*"));
+        assert_ne!(a.condition_signature(), b.condition_signature());
     }
 }

@@ -4,7 +4,6 @@
 //! Supports composite keys from multiple extractors.
 //! Missing components use placeholders to prevent bypass.
 
-use crate::error::RateLimitError;
 use crate::rules::ast::{EvalContext, KeyExpr, KeyExtractor};
 
 /// Placeholder used when a key component is unavailable.
@@ -13,12 +12,12 @@ const MISSING_PLACEHOLDER: &str = "__no_value__";
 /// Extract a rate limit key from the request context.
 /// Missing components use a placeholder instead of failing,
 /// so rate limiting is never bypassed by omitting headers.
-pub fn extract_key(key_expr: &KeyExpr, ctx: &EvalContext) -> Result<String, RateLimitError> {
+pub fn extract_key(key_expr: &KeyExpr, ctx: &EvalContext) -> String {
     match key_expr {
-        KeyExpr::Single(extractor) => Ok(extract_single(extractor, ctx)),
+        KeyExpr::Single(extractor) => extract_single(extractor, ctx),
         KeyExpr::Composite(extractors) => {
             let parts: Vec<String> = extractors.iter().map(|e| extract_single(e, ctx)).collect();
-            Ok(parts.join(":"))
+            parts.join(":")
         }
     }
 }
@@ -74,7 +73,7 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("api.example.com", "/", &headers, None);
 
-        let key = extract_key(&KeyExpr::Single(KeyExtractor::Host(None)), &ctx).unwrap();
+        let key = extract_key(&KeyExpr::Single(KeyExtractor::Host(None)), &ctx);
         assert_eq!(key, "api.example.com");
     }
 
@@ -83,7 +82,7 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("example.com", "/api/v1/users", &headers, None);
 
-        let key = extract_key(&KeyExpr::Single(KeyExtractor::Path(None)), &ctx).unwrap();
+        let key = extract_key(&KeyExpr::Single(KeyExtractor::Path(None)), &ctx);
         assert_eq!(key, "/api/v1/users");
     }
 
@@ -96,8 +95,7 @@ mod tests {
         let key = extract_key(
             &KeyExpr::Single(KeyExtractor::Header("X-Customer-Id".to_string())),
             &ctx,
-        )
-        .unwrap();
+        );
         assert_eq!(key, "customer-123");
     }
 
@@ -109,8 +107,7 @@ mod tests {
         let key = extract_key(
             &KeyExpr::Single(KeyExtractor::Header("X-Customer-Id".to_string())),
             &ctx,
-        )
-        .unwrap();
+        );
         assert_eq!(key, "__no_value__");
     }
 
@@ -119,7 +116,7 @@ mod tests {
         let headers = HashMap::new();
         let ctx = make_ctx("example.com", "/", &headers, Some("192.168.1.100"));
 
-        let key = extract_key(&KeyExpr::Single(KeyExtractor::ClientIp), &ctx).unwrap();
+        let key = extract_key(&KeyExpr::Single(KeyExtractor::ClientIp), &ctx);
         assert_eq!(key, "192.168.1.100");
     }
 
@@ -135,7 +132,7 @@ mod tests {
             KeyExtractor::Host(None),
         ]);
 
-        let key = extract_key(&key_expr, &ctx).unwrap();
+        let key = extract_key(&key_expr, &ctx);
         assert_eq!(key, "cust-42:/v1/orders:api.example.com");
     }
 
@@ -150,7 +147,7 @@ mod tests {
         ]);
 
         // Should succeed with placeholder instead of failing
-        let key = extract_key(&key_expr, &ctx).unwrap();
+        let key = extract_key(&key_expr, &ctx);
         assert_eq!(key, "__no_value__:api.example.com");
     }
 

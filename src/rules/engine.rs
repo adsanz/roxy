@@ -102,15 +102,23 @@ impl RuleIndex {
 
     /// Build rule index from configuration.
     /// Rules are evaluated in the order they appear in the config (first-match-wins).
-    pub fn from_config(rules: &[RuleConfig]) -> Result<Self, ParseError> {
+    /// Collects all parse errors and returns them together (fail-fast aggregation).
+    pub fn from_config(rules: &[RuleConfig]) -> Result<Self, Vec<ParseError>> {
         let mut index = Self::new();
+        let mut errors = Vec::new();
 
         for rule_config in rules {
-            let compiled = parse_rule(&rule_config.name, &rule_config.rule)?;
-            index.add_rule(compiled);
+            match parse_rule(&rule_config.name, &rule_config.rule) {
+                Ok(compiled) => index.add_rule(compiled),
+                Err(e) => errors.push(e),
+            }
         }
 
-        Ok(index)
+        if errors.is_empty() {
+            Ok(index)
+        } else {
+            Err(errors)
+        }
     }
 
     /// Add a compiled rule to the index.
@@ -138,6 +146,73 @@ impl RuleIndex {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Check for unreachable rules and log warnings.
+    ///
+    /// A ternary rule (one with an `else_action`) always fires — it handles both
+    /// match and no-match cases. Any rule evaluated after a ternary rule in the
+    /// same method bucket is unreachable.
+    pub fn warn_unreachable(&self) {
+        use tracing::warn;
+
+        // Check each method bucket independently
+        for (method, indices) in &self.method_index {
+            let mut seen_catchall: Option<&str> = None;
+
+            for &idx in indices {
+                let rule = &self.rules[idx];
+
+                if let Some(catchall_name) = seen_catchall {
+                    let method_label = method
+                        .as_ref()
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_else(|| "ANY".to_string());
+                    warn!(
+                        target: "rules",
+                        rule = %rule.name,
+                        shadowed_by = %catchall_name,
+                        method = %method_label,
+                        "Rule is unreachable — ternary rule '{}' always matches first",
+                        catchall_name
+                    );
+                    continue;
+                }
+
+                // A ternary rule always takes an action (match → action, no-match → else_action)
+                if rule.else_action.is_some() {
+                    seen_catchall = Some(&rule.name);
+                }
+            }
+        }
+    }
+
+    /// Check for rules with duplicate conditions and log warnings.
+    ///
+    /// When two rules share the same condition expression, only the first one
+    /// can ever fire (first-match-wins). This is almost always a config mistake.
+    pub fn warn_duplicate_conditions(&self) {
+        use std::collections::HashMap as StdHashMap;
+        use tracing::warn;
+
+        // Map: canonical condition signature → first rule name that used it
+        let mut seen: StdHashMap<String, &str> = StdHashMap::new();
+
+        for rule in &self.rules {
+            let sig = rule.condition.condition_signature();
+            if let Some(first_name) = seen.get(&sig) {
+                warn!(
+                    target: "rules",
+                    rule = %rule.name,
+                    duplicate_of = %first_name,
+                    condition = %sig,
+                    "Rule has the same condition as '{}' — only the first rule will ever match",
+                    first_name
+                );
+            } else {
+                seen.insert(sig, &rule.name);
+            }
+        }
     }
 
     /// Evaluate rules against the request context.
@@ -499,6 +574,79 @@ mod tests {
 
         let index = RuleIndex::from_config(&configs).unwrap();
         assert_eq!(index.rule_count(), 2);
+    }
+
+    #[test]
+    fn test_from_config_collects_all_errors() {
+        let configs = vec![
+            RuleConfig {
+                name: "good-rule".to_string(),
+                rule: r#"host("*.com") = block"#.to_string(),
+            },
+            RuleConfig {
+                name: "bad-rule-1".to_string(),
+                rule: "".to_string(), // empty expression
+            },
+            RuleConfig {
+                name: "bad-rule-2".to_string(),
+                rule: r#"host("[invalid") = block"#.to_string(), // bad glob
+            },
+        ];
+
+        let result = RuleIndex::from_config(&configs);
+        assert!(result.is_err(), "Should have failed with parse errors");
+        let errors = match result {
+            Err(e) => e,
+            Ok(_) => panic!("Expected errors"),
+        };
+        assert_eq!(
+            errors.len(),
+            2,
+            "Should collect both errors, got: {:?}",
+            errors
+        );
+
+        // Verify each error has the right rule name
+        let names: Vec<_> = errors.iter().map(|e| e.to_string()).collect();
+        assert!(names.iter().any(|m| m.contains("bad-rule-1")));
+        assert!(names.iter().any(|m| m.contains("bad-rule-2")));
+    }
+
+    #[test]
+    fn test_duplicate_conditions_detected() {
+        // Two rules with identical conditions but different actions
+        let configs = vec![
+            RuleConfig {
+                name: "rule-a".to_string(),
+                rule: r#"host("api.*") && path("/v1/*") = block"#.to_string(),
+            },
+            RuleConfig {
+                name: "rule-b".to_string(),
+                rule: r#"host("api.*") && path("/v1/*") = pass"#.to_string(),
+            },
+            RuleConfig {
+                name: "rule-c".to_string(),
+                rule: r#"host("other.*") = block"#.to_string(),
+            },
+        ];
+
+        let index = RuleIndex::from_config(&configs).unwrap();
+
+        // Verify signatures match for the duplicate pair
+        let sigs: Vec<String> = index
+            .rules
+            .iter()
+            .map(|r| r.condition.condition_signature())
+            .collect();
+
+        assert_eq!(
+            sigs[0], sigs[1],
+            "rule-a and rule-b should have the same signature"
+        );
+        assert_ne!(sigs[0], sigs[2], "rule-a and rule-c should differ");
+
+        // warn_duplicate_conditions should not panic
+        index.warn_duplicate_conditions();
     }
 
     #[test]
