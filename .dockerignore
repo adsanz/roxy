@@ -22,6 +22,7 @@ docs/
 # Tests and benchmarks (not needed in image)
 benches/
 tests/
+loadtest/
 **/tests/
 **/*_test.rs
 
@@ -49,3 +50,7 @@ Thumbs.db
 # Rust
 rustfmt.toml
 .cargo/
+
+# Misc
+*.key
+*.crt
