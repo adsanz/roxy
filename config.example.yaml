@@ -9,6 +9,12 @@ listen: "0.0.0.0:8080"
 #   ca_key: "./ca.key"
 #   cert_cache_size: 1000
 
+# Connection pool settings (optional)
+# Limits prevent unbounded memory growth and mitigate DoS attacks
+pool:
+  max_idle_per_host: 10    # Maximum idle connections per upstream host
+  idle_timeout_secs: 30    # Seconds before idle connections are closed
+
 # Rate limit settings (optional)
 rate_limit:
   cleanup_interval_secs: 60
@@ -35,6 +41,20 @@ rules:
   - name: "public-rate-limit"
     rule: 'path("/public/*") = rate_limit(10/m, ip)'
 
+  # Credit-based rate limiting (fixed budget with scheduled reset)
+  # Periods: /d (daily), /w (weekly), /M (monthly)
+  - name: "api-credits"
+    rule: 'host("api.*") && path("/v2/*") = credit(1000/d, header(X-Customer-Id))'
+
+  # Composite: rate limit (burst) + credit (budget) on the same rule
+  # Rate limit enforces per-second burst protection; credit enforces daily budget.
+  # Both must pass for the request to proceed.
+  - name: "api-protected"
+    rule: 'host("api.*") && path("/v3/*") = rate_limit(50/s, header(X-Customer-Id)) + credit(5000/d, header(X-Customer-Id))'
+
+  - name: "premium-credits"
+    rule: 'host("api.*") && header("X-Plan:premium") = credit(50000/M, header(X-Customer-Id))'
+
   # Mangle headers for backend requests
   - name: "backend-headers"
     rule: 'host("backend.*") = mangle'
@@ -53,3 +73,36 @@ headers:
         value: "roxy"
     remove:
       - "X-Internal-Debug"
+
+# Throttle config: progressive delay (soft limit) for rate_limit rules
+# Delay ramps linearly from 0ms at soft_limit to max_delay_ms at the hard limit
+throttle:
+  - rule: "api-rate-limit"
+    soft_limit: 80          # Start throttling at 80 req/s (hard limit is 100)
+    max_delay_ms: 2000       # Max delay when approaching hard limit
+
+  - rule: "api-protected"
+    soft_limit: 40           # Start throttling at 40 req/s (hard limit is 50)
+    max_delay_ms: 1500
+
+# Credit system config
+# Credits are a fixed budget that resets on a schedule (daily/weekly/monthly)
+# Formats: "daily@HH:MM", "weekly@Day-HH:MM", "monthly@DD-HH:MM" (UTC)
+credits:
+  - rule: "api-credits"
+    soft_limit: 800          # Start throttling at 800/1000 credits used
+    max_delay_ms: 2000
+    reset_schedule: "daily@00:00"
+    message: "API credit exhausted. Resets at {reset_time}."
+
+  - rule: "premium-credits"
+    soft_limit: 40000
+    max_delay_ms: 3000
+    reset_schedule: "monthly@01-00:00"
+    message: "Monthly credit limit reached. Resets at {reset_time}."
+
+  - rule: "api-protected"
+    soft_limit: 4000
+    max_delay_ms: 2000
+    reset_schedule: "daily@00:00"
+    message: "API budget exhausted. Resets at {reset_time}."

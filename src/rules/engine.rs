@@ -47,6 +47,29 @@ pub enum RuleResult {
         /// Headers to log (existence-only checks with their values)
         logged_headers: HashMap<String, String>,
     },
+
+    /// Request should be credit-checked
+    Credit {
+        rule_name: String,
+        credits: u64,
+        period: CreditPeriod,
+        key_expr: KeyExpr,
+        /// Headers to log (existence-only checks with their values)
+        logged_headers: HashMap<String, String>,
+    },
+
+    /// Request should be both rate-limited (burst) and credit-checked (budget)
+    RateLimitCredit {
+        rule_name: String,
+        requests: u64,
+        window_secs: u64,
+        rate_key_expr: KeyExpr,
+        credits: u64,
+        period: CreditPeriod,
+        credit_key_expr: KeyExpr,
+        /// Headers to log (existence-only checks with their values)
+        logged_headers: HashMap<String, String>,
+    },
 }
 
 /// Rule engine that preserves config order for first-match-wins semantics.
@@ -96,6 +119,19 @@ impl RuleIndex {
     /// Get total number of rules.
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Extract credit budgets from parsed rules.
+    /// Returns Vec of (rule_name, budget) for all credit and composite rules.
+    pub fn credit_budgets(&self) -> Vec<(String, u64)> {
+        self.rules
+            .iter()
+            .filter_map(|rule| match &rule.action {
+                Action::Credit { credits, .. } => Some((rule.name.clone(), *credits)),
+                Action::RateLimitCredit { credits, .. } => Some((rule.name.clone(), *credits)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Evaluate rules against the request context.
@@ -208,6 +244,34 @@ impl RuleIndex {
                 requests: *requests,
                 window_secs: *window_secs,
                 key_expr: key_expr.clone(),
+                logged_headers,
+            },
+            Action::Credit {
+                credits,
+                period,
+                key_expr,
+            } => RuleResult::Credit {
+                rule_name: rule_name.to_string(),
+                credits: *credits,
+                period: *period,
+                key_expr: key_expr.clone(),
+                logged_headers,
+            },
+            Action::RateLimitCredit {
+                requests,
+                window_secs,
+                rate_key_expr,
+                credits,
+                period,
+                credit_key_expr,
+            } => RuleResult::RateLimitCredit {
+                rule_name: rule_name.to_string(),
+                requests: *requests,
+                window_secs: *window_secs,
+                rate_key_expr: rate_key_expr.clone(),
+                credits: *credits,
+                period: *period,
+                credit_key_expr: credit_key_expr.clone(),
                 logged_headers,
             },
         }
@@ -532,6 +596,58 @@ mod tests {
             }
             _ => panic!("Expected Block result"),
         }
+    }
+
+    #[test]
+    fn test_composite_rate_limit_credit_result() {
+        let mut index = RuleIndex::new();
+
+        let rule = parse_rule(
+            "api-protected",
+            r#"host("api.*") = rate_limit(100/s, header(X-Id)) + credit(1000/d, header(X-Id))"#,
+        )
+        .unwrap();
+        index.add_rule(rule);
+
+        let mut headers = HashMap::new();
+        headers.insert("x-id".to_string(), "cust-123".to_string());
+        let ctx = make_ctx("api.example.com", "/v1/data", Method::GET, &headers);
+
+        let result = index.evaluate(&ctx);
+        assert!(
+            matches!(&result, RuleResult::RateLimitCredit { rule_name, requests, credits, .. }
+                if rule_name == "api-protected" && *requests == 100 && *credits == 1000),
+            "Expected RateLimitCredit result, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_credit_budgets_includes_composite() {
+        let mut index = RuleIndex::new();
+
+        let rule = parse_rule("credit-only", r#"host("a.*") = credit(500/d, ip)"#).unwrap();
+        index.add_rule(rule);
+
+        let rule = parse_rule(
+            "composite",
+            r#"host("b.*") = rate_limit(10/s, ip) + credit(2000/w, ip)"#,
+        )
+        .unwrap();
+        index.add_rule(rule);
+
+        let budgets = index.credit_budgets();
+        assert_eq!(budgets.len(), 2);
+        assert!(
+            budgets
+                .iter()
+                .any(|(name, budget)| name == "credit-only" && *budget == 500)
+        );
+        assert!(
+            budgets
+                .iter()
+                .any(|(name, budget)| name == "composite" && *budget == 2000)
+        );
     }
 
     #[test]

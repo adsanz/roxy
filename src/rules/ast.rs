@@ -85,6 +85,43 @@ pub enum Action {
         /// Key extractor expression
         key_expr: KeyExpr,
     },
+
+    /// Credit-based rate limiting with fixed budget and scheduled reset
+    Credit {
+        /// Total credits per period
+        credits: u64,
+        /// Reset period
+        period: CreditPeriod,
+        /// Key extractor expression
+        key_expr: KeyExpr,
+    },
+
+    /// Composite: rate limit (burst) + credit (budget) on the same rule
+    RateLimitCredit {
+        /// Rate limit: requests per window
+        requests: u64,
+        /// Rate limit: window duration in seconds
+        window_secs: u64,
+        /// Rate limit: key extractor
+        rate_key_expr: KeyExpr,
+        /// Credit: total credits per period
+        credits: u64,
+        /// Credit: reset period
+        period: CreditPeriod,
+        /// Credit: key extractor
+        credit_key_expr: KeyExpr,
+    },
+}
+
+/// Credit reset period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreditPeriod {
+    /// Daily reset
+    Day,
+    /// Weekly reset
+    Week,
+    /// Monthly reset
+    Month,
 }
 
 /// Key extraction expression for rate limiting.
@@ -95,6 +132,19 @@ pub enum KeyExpr {
 
     /// Composite key (concatenated extractors)
     Composite(Vec<KeyExtractor>),
+}
+
+impl KeyExpr {
+    /// Check if this key expression contains any Header extractors.
+    /// Header-based keys are user-controlled and require IP baseline enforcement.
+    pub fn has_header_extractor(&self) -> bool {
+        match self {
+            KeyExpr::Single(e) => matches!(e, KeyExtractor::Header(_)),
+            KeyExpr::Composite(extractors) => extractors
+                .iter()
+                .any(|e| matches!(e, KeyExtractor::Header(_))),
+        }
+    }
 }
 
 /// Individual key extractor.

@@ -2,52 +2,49 @@
 //!
 //! Extracts values from requests to build rate limit keys.
 //! Supports composite keys from multiple extractors.
+//! Missing components use placeholders to prevent bypass.
 
 use crate::error::RateLimitError;
 use crate::rules::ast::{EvalContext, KeyExpr, KeyExtractor};
 
+/// Placeholder used when a key component is unavailable.
+const MISSING_PLACEHOLDER: &str = "__no_value__";
+
 /// Extract a rate limit key from the request context.
+/// Missing components use a placeholder instead of failing,
+/// so rate limiting is never bypassed by omitting headers.
 pub fn extract_key(key_expr: &KeyExpr, ctx: &EvalContext) -> Result<String, RateLimitError> {
     match key_expr {
-        KeyExpr::Single(extractor) => extract_single(extractor, ctx),
+        KeyExpr::Single(extractor) => Ok(extract_single(extractor, ctx)),
         KeyExpr::Composite(extractors) => {
-            let parts: Result<Vec<String>, _> =
-                extractors.iter().map(|e| extract_single(e, ctx)).collect();
-            Ok(parts?.join(":"))
+            let parts: Vec<String> = extractors.iter().map(|e| extract_single(e, ctx)).collect();
+            Ok(parts.join(":"))
         }
     }
 }
 
+/// Extract the IP-only key for baseline enforcement.
+/// Returns the client IP or a placeholder if unavailable.
+pub fn extract_ip_key(rule_name: &str, ctx: &EvalContext) -> String {
+    let ip = ctx.client_ip.unwrap_or(MISSING_PLACEHOLDER);
+    format!("__ip_baseline__:{}:{}", rule_name, ip)
+}
+
 /// Extract a single key component.
-fn extract_single(extractor: &KeyExtractor, ctx: &EvalContext) -> Result<String, RateLimitError> {
+/// Returns a placeholder for missing values instead of failing.
+fn extract_single(extractor: &KeyExtractor, ctx: &EvalContext) -> String {
     match extractor {
-        KeyExtractor::Host(pattern) => {
-            if pattern.is_none() {
-                // Full host
-                Ok(ctx.host.to_string())
-            } else {
-                // TODO: Pattern capture (for now, just return full host)
-                Ok(ctx.host.to_string())
-            }
-        }
-        KeyExtractor::Path(pattern) => {
-            if pattern.is_none() {
-                // Full path
-                Ok(ctx.path.to_string())
-            } else {
-                // TODO: Pattern capture (for now, just return full path)
-                Ok(ctx.path.to_string())
-            }
-        }
+        KeyExtractor::Host(_pattern) => ctx.host.to_string(),
+        KeyExtractor::Path(_pattern) => ctx.path.to_string(),
         KeyExtractor::Header(name) => ctx
             .headers
             .get(&name.to_lowercase())
             .cloned()
-            .ok_or_else(|| RateLimitError::KeyExtraction(format!("Header '{}' not found", name))),
+            .unwrap_or_else(|| MISSING_PLACEHOLDER.to_string()),
         KeyExtractor::ClientIp => ctx
             .client_ip
             .map(|s| s.to_string())
-            .ok_or_else(|| RateLimitError::KeyExtraction("Client IP not available".to_string())),
+            .unwrap_or_else(|| MISSING_PLACEHOLDER.to_string()),
     }
 }
 
@@ -105,15 +102,16 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_header_missing() {
+    fn test_extract_header_missing_uses_placeholder() {
         let headers = HashMap::new();
         let ctx = make_ctx("example.com", "/", &headers, None);
 
-        let result = extract_key(
+        let key = extract_key(
             &KeyExpr::Single(KeyExtractor::Header("X-Customer-Id".to_string())),
             &ctx,
-        );
-        assert!(result.is_err());
+        )
+        .unwrap();
+        assert_eq!(key, "__no_value__");
     }
 
     #[test]
@@ -142,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_key_fails_if_any_missing() {
+    fn test_composite_key_graceful_with_missing_header() {
         let headers = HashMap::new(); // Missing header
         let ctx = make_ctx("api.example.com", "/v1/orders", &headers, None);
 
@@ -151,7 +149,17 @@ mod tests {
             KeyExtractor::Host(None),
         ]);
 
-        let result = extract_key(&key_expr, &ctx);
-        assert!(result.is_err());
+        // Should succeed with placeholder instead of failing
+        let key = extract_key(&key_expr, &ctx).unwrap();
+        assert_eq!(key, "__no_value__:api.example.com");
+    }
+
+    #[test]
+    fn test_extract_ip_key() {
+        let headers = HashMap::new();
+        let ctx = make_ctx("example.com", "/", &headers, Some("10.0.0.1"));
+
+        let key = extract_ip_key("my-rule", &ctx);
+        assert_eq!(key, "__ip_baseline__:my-rule:10.0.0.1");
     }
 }

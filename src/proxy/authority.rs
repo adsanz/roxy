@@ -15,6 +15,7 @@ use hudsucker::rustls::{
     ServerConfig,
     crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    server::NoServerSessionStorage,
 };
 use moka::future::Cache;
 use rand::{Rng, rng};
@@ -25,8 +26,11 @@ use tracing::debug;
 /// Certificate validity period in seconds (1 year)
 const TTL_SECS: i64 = 365 * 24 * 60 * 60;
 
-/// Cache TTL - half the certificate validity period
-const CACHE_TTL: u64 = TTL_SECS as u64 / 2;
+/// Cache TTL - 24 hours.
+/// Certificates are cheap to regenerate; keeping them for the full validity
+/// period (182 days) causes unbounded memory growth from accumulated
+/// TLS session caches inside each ServerConfig.
+const CACHE_TTL: u64 = 24 * 60 * 60;
 
 /// Offset for not_before to handle clock skew (60 seconds)
 const NOT_BEFORE_OFFSET: i64 = 60;
@@ -157,6 +161,12 @@ impl CertificateAuthority for RoxyAuthority {
             .expect("Failed to build ServerConfig");
 
         server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        // Disable TLS session resumption cache. Each ServerSessionMemoryCache
+        // pre-allocates ~25KB of hash table. With hundreds of cached hosts,
+        // this causes significant memory growth. Session resumption between
+        // client and MITM proxy has no value since certs are generated on the fly.
+        server_cfg.session_storage = Arc::new(NoServerSessionStorage {});
 
         let server_cfg = Arc::new(server_cfg);
 

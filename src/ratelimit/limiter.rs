@@ -15,8 +15,11 @@ pub struct RateLimiter {
     /// Interval for cleanup of expired entries
     cleanup_interval: Duration,
 
-    /// Last cleanup time
+    /// Last cleanup time (milliseconds since start_time)
     last_cleanup: AtomicU64,
+
+    /// Baseline instant for computing elapsed time
+    start_time: Instant,
 }
 
 /// Sliding window counter for a single key.
@@ -28,8 +31,11 @@ pub struct SlidingWindow {
     /// Request count in previous window
     previous_count: AtomicU64,
 
-    /// Start time of current window (epoch millis)
+    /// Start time of current window (millis since RateLimiter start_time)
     window_start: AtomicU64,
+
+    /// Last access time (millis since RateLimiter start_time)
+    last_access: AtomicU64,
 
     /// Window duration in milliseconds
     window_ms: u64,
@@ -60,33 +66,40 @@ impl RateLimiter {
             windows: DashMap::new(),
             cleanup_interval,
             last_cleanup: AtomicU64::new(0),
+            start_time: Instant::now(),
         }
     }
 
     /// Check if a request should be allowed for the given key.
     pub fn check(&self, key: &str, max_requests: u64, window_secs: u64) -> RateLimitResult {
         let now = Instant::now();
-        let now_ms = now.elapsed().as_millis() as u64;
+        let now_ms = now.duration_since(self.start_time).as_millis() as u64;
 
-        // Try to get existing window or create new one
-        let mut entry = self
-            .windows
-            .entry(key.to_string())
-            .or_insert_with(|| SlidingWindow::new(max_requests, window_secs * 1000, now_ms));
+        // Scope the DashMap entry so the shard write-lock is released before
+        // maybe_cleanup(). retain() acquires write-locks on every shard;
+        // calling it while we still hold one causes a same-thread deadlock
+        // because parking_lot::RwLock is not reentrant.
+        let result = {
+            let mut entry = self
+                .windows
+                .entry(key.to_string())
+                .or_insert_with(|| SlidingWindow::new(max_requests, window_secs * 1000, now_ms));
 
-        let window = entry.value_mut();
-        let result = window.check_and_increment(now_ms);
+            let window = entry.value_mut();
+            window.check_and_increment(now_ms)
+        }; // entry (shard lock) dropped here
 
-        // Periodic cleanup
+        // Periodic cleanup — safe now, no shard lock held
         self.maybe_cleanup(now_ms);
 
         result
     }
 
-    // NOTE: For future Prometheus integration, add these methods:
-    // - peek(): check without incrementing
-    // - key_count(): get number of tracked keys
-    // - window_stats(): get per-key statistics
+    /// Get the number of tracked keys (for monitoring/testing).
+    #[cfg(test)]
+    pub fn key_count(&self) -> usize {
+        self.windows.len()
+    }
 
     /// Remove expired entries.
     fn maybe_cleanup(&self, now_ms: u64) {
@@ -103,13 +116,30 @@ impl RateLimiter {
         }
     }
 
+    /// Compute elapsed milliseconds since the rate limiter was created.
+    pub fn elapsed_ms(&self) -> u64 {
+        Instant::now().duration_since(self.start_time).as_millis() as u64
+    }
+
+    /// Force a cleanup of expired entries. Called from background task.
+    pub fn force_cleanup(&self) {
+        let now_ms = self.elapsed_ms();
+        // Update last_cleanup so maybe_cleanup() in check() does not
+        // redundantly run cleanup right after the background task.
+        self.last_cleanup.store(now_ms, Ordering::Relaxed);
+        self.cleanup(now_ms);
+    }
+
     /// Remove entries that haven't been accessed in 2 windows.
     fn cleanup(&self, now_ms: u64) {
         self.windows.retain(|_, window| {
-            let window_start = window.window_start.load(Ordering::Relaxed);
+            let last_access = window.last_access.load(Ordering::Relaxed);
             // Keep if accessed within last 2 windows
-            now_ms - window_start < window.window_ms * 2
+            now_ms.saturating_sub(last_access) < window.window_ms * 2
         });
+        // Release hash table capacity freed by retain().
+        // Without this, DashMap retains its high-water capacity forever.
+        self.windows.shrink_to_fit();
     }
 }
 
@@ -120,13 +150,24 @@ impl SlidingWindow {
             current_count: AtomicU64::new(0),
             previous_count: AtomicU64::new(0),
             window_start: AtomicU64::new(now_ms),
+            last_access: AtomicU64::new(now_ms),
             window_ms,
             max_requests,
         }
     }
 
+    /// Check if this window has expired (not accessed in 2 windows).
+    #[allow(dead_code)]
+    pub fn is_expired(&self, now_ms: u64) -> bool {
+        let last_access = self.last_access.load(Ordering::Relaxed);
+        now_ms.saturating_sub(last_access) >= self.window_ms * 2
+    }
+
     /// Check if request is allowed and increment counter if so.
     fn check_and_increment(&self, now_ms: u64) -> RateLimitResult {
+        // Update last access time
+        self.last_access.store(now_ms, Ordering::Relaxed);
+
         self.maybe_rotate(now_ms);
 
         let window_start = self.window_start.load(Ordering::Relaxed);

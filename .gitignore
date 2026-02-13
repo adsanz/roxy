@@ -1,2 +1,6 @@
 /target
 tests/
+*.key
+*.crt
+*.pem
+config.yaml

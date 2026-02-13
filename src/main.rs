@@ -7,15 +7,18 @@ use hudsucker::{
     rustls::crypto::aws_lc_rs,
     Proxy,
 };
+use hyper_util::client::legacy::Builder as ClientBuilder;
+use hyper_util::rt::TokioExecutor;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use roxy::config::ProxyConfig;
 use roxy::proxy::{RoxyAuthority, RoxyHandler};
-use roxy::ratelimit::RateLimiter;
+use roxy::ratelimit::{CreditManager, CreditRuleConfig, RateLimiter, ResetSchedule};
 use roxy::rules::RuleIndex;
 
 /// Command line arguments.
@@ -119,16 +122,18 @@ fn create_ca(config: &ProxyConfig) -> RoxyAuthority {
         let issuer = hudsucker::rcgen::Issuer::from_ca_cert_pem(&cert_pem, key_pair)
             .expect("Failed to create issuer from generated CA");
 
-        RoxyAuthority::new(issuer, &cert_pem, 1000, aws_lc_rs::default_provider())
+        RoxyAuthority::new(issuer, &cert_pem, 100, aws_lc_rs::default_provider())
     }
 }
 
 /// Graceful shutdown signal handler.
-async fn shutdown_signal() {
+/// Returns a Notify that is triggered when Ctrl+C is received.
+async fn shutdown_signal(shutdown: Arc<tokio::sync::Notify>) {
     tokio::signal::ctrl_c()
         .await
         .expect("Failed to install CTRL+C signal handler");
     info!(target: "proxy", "Shutdown signal received");
+    shutdown.notify_waiters();
 }
 
 #[tokio::main]
@@ -176,8 +181,90 @@ async fn main() {
 
     let rate_limiter = Arc::new(RateLimiter::new(cleanup_interval));
 
+    // Shutdown signal for background tasks
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+
+    // Spawn background cleanup task for rate limiter.
+    // Cleanup is also piggybacked on check() calls, but with low traffic
+    // or no rate-limit rules matching, check() may never be called.
+    let cleanup_limiter = Arc::clone(&rate_limiter);
+    let shutdown_rl = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cleanup_interval);
+        interval.tick().await; // Skip immediate first tick
+        loop {
+            tokio::select! {
+                _ = interval.tick() => cleanup_limiter.force_cleanup(),
+                _ = shutdown_rl.notified() => break,
+            }
+        }
+    });
+
+    // Create credit manager and register credit rules from config
+    let credit_manager = Arc::new(CreditManager::new());
+
+    // Get credit budgets from parsed DSL rules
+    let credit_budgets: std::collections::HashMap<String, u64> =
+        rules.credit_budgets().into_iter().collect();
+
+    for credit_cfg in &config.credits {
+        let schedule = match ResetSchedule::parse(&credit_cfg.reset_schedule) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(target: "proxy", rule = %credit_cfg.rule, error = %e, "Invalid credit reset schedule");
+                std::process::exit(1);
+            }
+        };
+
+        let budget = match credit_budgets.get(&credit_cfg.rule) {
+            Some(&b) => b,
+            None => {
+                error!(target: "proxy", rule = %credit_cfg.rule, "Credit config references rule without credit() action in DSL");
+                std::process::exit(1);
+            }
+        };
+
+        credit_manager.register_rule(
+            credit_cfg.rule.clone(),
+            CreditRuleConfig {
+                budget,
+                soft_limit: credit_cfg.soft_limit,
+                max_delay_ms: credit_cfg.max_delay_ms,
+                schedule,
+                message: credit_cfg.message.clone(),
+            },
+        );
+        info!(
+            target: "proxy",
+            rule = %credit_cfg.rule,
+            budget = budget,
+            reset_schedule = %credit_cfg.reset_schedule,
+            "Registered credit rule"
+        );
+    }
+
+    // Spawn background cleanup task for credit manager
+    let cleanup_credits = Arc::clone(&credit_manager);
+    let shutdown_cr = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cleanup_interval);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => cleanup_credits.force_cleanup(),
+                _ = shutdown_cr.notified() => break,
+            }
+        }
+    });
+
     // Create handler
-    let handler = RoxyHandler::new(rules, rate_limiter, config.headers.clone());
+    let handler = RoxyHandler::new(
+        rules,
+        rate_limiter,
+        credit_manager,
+        config.headers.clone(),
+        config.throttle.clone(),
+    );
 
     // Create Certificate Authority for MITM
     let ca = create_ca(&config);
@@ -194,13 +281,29 @@ async fn main() {
         "Starting MITM proxy"
     );
 
+    // Configure connection pool limits to prevent unbounded memory growth.
+    // This mitigates DoS attacks where an attacker forces connections to many unique hosts.
+    let pool_config = config.pool.clone().unwrap_or_default();
+    let mut client_builder = ClientBuilder::new(TokioExecutor::new());
+    client_builder
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
+        .pool_max_idle_per_host(pool_config.max_idle_per_host);
+
+    info!(
+        target: "proxy",
+        pool_max_idle_per_host = pool_config.max_idle_per_host,
+        pool_idle_timeout_secs = pool_config.idle_timeout_secs,
+        "Connection pool configured"
+    );
+
     // Build and start proxy
     let proxy = Proxy::builder()
         .with_addr(addr)
         .with_ca(ca)
         .with_rustls_connector(aws_lc_rs::default_provider())
+        .with_client(client_builder)
         .with_http_handler(handler)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown)))
         .build()
         .expect("Failed to create proxy");
 

@@ -10,6 +10,9 @@ hudsucker = { version = "0.24", features = ["rcgen-ca", "http2"] }
 # Async runtime (hudsucker uses tokio)
 tokio = { version = "1", features = ["full", "signal"] }
 
+# Utils to tackle internal configs
+hyper-util = { version = "0.1", features = ["full"] }
+
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
@@ -22,6 +25,9 @@ globset = "0.4"
 
 # Rate limiting
 dashmap = "6"
+
+# Date/time handling
+chrono = "0.4"
 
 # Certificate cache
 lru = "0.12"
