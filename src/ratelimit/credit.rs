@@ -117,7 +117,7 @@ impl ResetSchedule {
 
     /// Compute the next reset time as epoch seconds after `now`.
     pub fn next_reset_after(&self, now_epoch: u64) -> u64 {
-        let now = DateTime::from_timestamp(now_epoch as i64, 0).unwrap_or_else(|| Utc::now());
+        let now = DateTime::from_timestamp(now_epoch as i64, 0).unwrap_or_else(Utc::now);
 
         let next = match self {
             ResetSchedule::Daily { hour, minute } => {
@@ -168,7 +168,7 @@ impl ResetSchedule {
     /// Format epoch seconds as "YYYY-MM-DDTHH:MM:SSZ".
     pub fn format_reset_time(epoch_secs: u64) -> String {
         DateTime::from_timestamp(epoch_secs as i64, 0)
-            .unwrap_or_else(|| Utc::now())
+            .unwrap_or_else(Utc::now)
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string()
     }
@@ -253,20 +253,20 @@ impl CreditManager {
         let remaining = config.budget.saturating_sub(new_used);
 
         // Progressive delay above soft limit
-        if let Some(soft_limit) = config.soft_limit {
-            if new_used > soft_limit {
-                let range = config.budget.saturating_sub(soft_limit);
-                let over = new_used.saturating_sub(soft_limit);
-                let delay_ms = if range > 0 {
-                    (over as f64 / range as f64 * config.max_delay_ms as f64) as u64
-                } else {
-                    config.max_delay_ms
-                };
-                return CreditResult::Throttled {
-                    remaining,
-                    delay_ms,
-                };
-            }
+        if let Some(soft_limit) = config.soft_limit
+            && new_used > soft_limit
+        {
+            let range = config.budget.saturating_sub(soft_limit);
+            let over = new_used.saturating_sub(soft_limit);
+            let delay_ms = if range > 0 {
+                (over as f64 / range as f64 * config.max_delay_ms as f64) as u64
+            } else {
+                config.max_delay_ms
+            };
+            return CreditResult::Throttled {
+                remaining,
+                delay_ms,
+            };
         }
 
         CreditResult::Allowed { remaining }

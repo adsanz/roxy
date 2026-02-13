@@ -735,11 +735,7 @@ mod tests {
     fn test_rate_limit_without_mangle_result() {
         let mut index = RuleIndex::new();
 
-        let rule = parse_rule(
-            "rl-only",
-            r#"host("api.*") = rate_limit(100/s, ip)"#,
-        )
-        .unwrap();
+        let rule = parse_rule("rl-only", r#"host("api.*") = rate_limit(100/s, ip)"#).unwrap();
         index.add_rule(rule);
 
         let headers = HashMap::new();

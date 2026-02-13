@@ -196,12 +196,7 @@ fn parse_action(input: &str) -> IResult<&str, Action> {
 ///   - rate_limit + mangle (or reverse) → RateLimit { mangle: true }
 ///   - credit + mangle (or reverse) → Credit { mangle: true }
 ///   - rate_limit + credit + mangle (any order) → RateLimitCredit { mangle: true }
-fn combine_actions<'a>(
-    a: Action,
-    b: Action,
-    c: Option<Action>,
-    input: &'a str,
-) -> IResult<&'a str, Action> {
+fn combine_actions(a: Action, b: Action, c: Option<Action>, input: &str) -> IResult<&str, Action> {
     // Collect actions into categorized slots
     let actions: Vec<Action> = match c {
         Some(third) => vec![a, b, third],
@@ -263,44 +258,42 @@ fn combine_actions<'a>(
 
     match (rate_limit, credit, has_mangle) {
         // rate_limit + credit (+ optional mangle)
-        (Some((requests, window_secs, rate_key_expr)), Some((credits, period, credit_key_expr)), mangle) => {
-            Ok((
-                input,
-                Action::RateLimitCredit {
-                    requests,
-                    window_secs,
-                    rate_key_expr,
-                    credits,
-                    period,
-                    credit_key_expr,
-                    mangle,
-                },
-            ))
-        }
+        (
+            Some((requests, window_secs, rate_key_expr)),
+            Some((credits, period, credit_key_expr)),
+            mangle,
+        ) => Ok((
+            input,
+            Action::RateLimitCredit {
+                requests,
+                window_secs,
+                rate_key_expr,
+                credits,
+                period,
+                credit_key_expr,
+                mangle,
+            },
+        )),
         // rate_limit + mangle
-        (Some((requests, window_secs, key_expr)), None, true) => {
-            Ok((
-                input,
-                Action::RateLimit {
-                    requests,
-                    window_secs,
-                    key_expr,
-                    mangle: true,
-                },
-            ))
-        }
+        (Some((requests, window_secs, key_expr)), None, true) => Ok((
+            input,
+            Action::RateLimit {
+                requests,
+                window_secs,
+                key_expr,
+                mangle: true,
+            },
+        )),
         // credit + mangle
-        (None, Some((credits, period, key_expr)), true) => {
-            Ok((
-                input,
-                Action::Credit {
-                    credits,
-                    period,
-                    key_expr,
-                    mangle: true,
-                },
-            ))
-        }
+        (None, Some((credits, period, key_expr)), true) => Ok((
+            input,
+            Action::Credit {
+                credits,
+                period,
+                key_expr,
+                mangle: true,
+            },
+        )),
         // Any other combo is invalid
         _ => Err(nom::Err::Failure(nom::error::Error::new(
             input,
@@ -769,18 +762,17 @@ mod tests {
             assert!(matches!(key_expr, KeyExpr::Single(KeyExtractor::Header(_))));
             assert!(mangle);
         } else {
-            panic!("Expected RateLimit action with mangle, got {:?}", rule.action);
+            panic!(
+                "Expected RateLimit action with mangle, got {:?}",
+                rule.action
+            );
         }
     }
 
     #[test]
     fn test_parse_mangle_plus_rate_limit() {
         // Reverse order: mangle first
-        let rule = parse_rule(
-            "test",
-            r#"host("api.*") = mangle + rate_limit(50/s, ip)"#,
-        )
-        .unwrap();
+        let rule = parse_rule("test", r#"host("api.*") = mangle + rate_limit(50/s, ip)"#).unwrap();
         if let Action::RateLimit {
             requests,
             window_secs,
@@ -792,7 +784,10 @@ mod tests {
             assert_eq!(window_secs, 1);
             assert!(mangle);
         } else {
-            panic!("Expected RateLimit action with mangle, got {:?}", rule.action);
+            panic!(
+                "Expected RateLimit action with mangle, got {:?}",
+                rule.action
+            );
         }
     }
 
@@ -821,11 +816,7 @@ mod tests {
     #[test]
     fn test_parse_mangle_plus_credit() {
         // Reverse order: mangle first
-        let rule = parse_rule(
-            "test",
-            r#"host("api.*") = mangle + credit(500/w, ip)"#,
-        )
-        .unwrap();
+        let rule = parse_rule("test", r#"host("api.*") = mangle + credit(500/w, ip)"#).unwrap();
         if let Action::Credit {
             credits,
             period,
@@ -860,7 +851,10 @@ mod tests {
             assert_eq!(credits, 1000);
             assert!(mangle);
         } else {
-            panic!("Expected RateLimitCredit action with mangle, got {:?}", rule.action);
+            panic!(
+                "Expected RateLimitCredit action with mangle, got {:?}",
+                rule.action
+            );
         }
     }
 
@@ -887,37 +881,31 @@ mod tests {
             assert_eq!(period, CreditPeriod::Week);
             assert!(mangle);
         } else {
-            panic!("Expected RateLimitCredit action with mangle, got {:?}", rule.action);
+            panic!(
+                "Expected RateLimitCredit action with mangle, got {:?}",
+                rule.action
+            );
         }
     }
 
     #[test]
     fn test_parse_invalid_block_plus_mangle() {
         // block + mangle is not valid
-        let result = parse_rule(
-            "test",
-            r#"host("api.*") = block + mangle"#,
-        );
+        let result = parse_rule("test", r#"host("api.*") = block + mangle"#);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_invalid_pass_plus_mangle() {
         // pass + mangle is not valid
-        let result = parse_rule(
-            "test",
-            r#"host("api.*") = pass + mangle"#,
-        );
+        let result = parse_rule("test", r#"host("api.*") = pass + mangle"#);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_invalid_duplicate_mangle() {
         // mangle + mangle is not valid
-        let result = parse_rule(
-            "test",
-            r#"host("api.*") = mangle + mangle"#,
-        );
+        let result = parse_rule("test", r#"host("api.*") = mangle + mangle"#);
         assert!(result.is_err());
     }
 }
