@@ -71,23 +71,31 @@ impl RateLimiter {
     }
 
     /// Check if a request should be allowed for the given key.
+    ///
+    /// Uses a two-phase lookup to avoid allocating a `String` for existing entries:
+    /// 1. `get_mut(&str)` — zero-alloc fast-path for keys already in the map
+    /// 2. `entry(key.to_string())` — allocates only on first sight of a new key
     pub fn check(&self, key: &str, max_requests: u64, window_secs: u64) -> RateLimitResult {
         let now = Instant::now();
         let now_ms = now.duration_since(self.start_time).as_millis() as u64;
 
-        // Scope the DashMap entry so the shard write-lock is released before
+        // Scope the DashMap access so the shard lock is released before
         // maybe_cleanup(). retain() acquires write-locks on every shard;
         // calling it while we still hold one causes a same-thread deadlock
         // because parking_lot::RwLock is not reentrant.
         let result = {
-            let mut entry = self
-                .windows
-                .entry(key.to_string())
-                .or_insert_with(|| SlidingWindow::new(max_requests, window_secs * 1000, now_ms));
-
-            let window = entry.value_mut();
-            window.check_and_increment(now_ms)
-        }; // entry (shard lock) dropped here
+            // Fast path: key already exists — zero alloc, just get_mut with &str
+            if let Some(window) = self.windows.get_mut(key) {
+                window.check_and_increment(now_ms)
+            } else {
+                // Slow path: first time seeing this key — allocate String for entry()
+                let mut entry = self
+                    .windows
+                    .entry(key.to_string())
+                    .or_insert_with(|| SlidingWindow::new(max_requests, window_secs * 1000, now_ms));
+                entry.value_mut().check_and_increment(now_ms)
+            }
+        }; // shard lock dropped here
 
         // Periodic cleanup — safe now, no shard lock held
         self.maybe_cleanup(now_ms);

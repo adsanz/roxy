@@ -7,6 +7,7 @@
 
 use globset::Glob;
 use http::Method;
+use http::header::HeaderName;
 use nom::{
     IResult,
     branch::alt,
@@ -33,6 +34,8 @@ enum RuleParseErrorKind {
     InvalidGlob { pattern: String, reason: String },
     /// Invalid HTTP method with the method string
     InvalidMethod { method: String },
+    /// Invalid header name (not valid HTTP header name bytes)
+    InvalidHeaderName { name: String, reason: String },
     /// Invalid action combination with a description
     InvalidActionCombination { detail: String },
     /// Invalid value (e.g. rate_limit(0/s, ...))
@@ -104,6 +107,13 @@ pub fn parse_rule(name: &str, input: &str) -> Result<CompiledRule, ParseError> {
                 RuleParseErrorKind::InvalidMethod { method } => Err(ParseError::InvalidMethod {
                     rule_name: name.to_string(),
                     method,
+                }),
+                RuleParseErrorKind::InvalidHeaderName {
+                    name: hdr_name,
+                    reason,
+                } => Err(ParseError::InvalidValue {
+                    rule_name: name.to_string(),
+                    detail: format!("invalid header name '{}': {}", hdr_name, reason),
                 }),
                 RuleParseErrorKind::InvalidActionCombination { detail } => {
                     Err(ParseError::InvalidActionCombination {
@@ -301,7 +311,10 @@ fn parse_header(input: &str) -> RResult<'_, Expr> {
     // Check for value match (Name:value) or glob match (Name~pattern)
     let (name, value) = if let Some(pos) = arg.find(':') {
         let (n, v) = arg.split_at(pos);
-        (n.to_string(), Some(HeaderMatch::Exact(v[1..].to_string())))
+        (
+            n.to_lowercase(),
+            Some(HeaderMatch::Exact(v[1..].to_string())),
+        )
     } else if let Some(pos) = arg.find('~') {
         let (n, v) = arg.split_at(pos);
         let glob = Glob::new(&v[1..])
@@ -315,12 +328,32 @@ fn parse_header(input: &str) -> RResult<'_, Expr> {
                 })
             })?
             .compile_matcher();
-        (n.to_string(), Some(HeaderMatch::Glob(glob)))
+        (n.to_lowercase(), Some(HeaderMatch::Glob(glob)))
     } else {
-        (arg, None)
+        (arg.to_lowercase(), None)
     };
 
-    Ok((input, Expr::Header { name, value }))
+    // Pre-compute HeaderName at parse time for zero-alloc HeaderMap lookups.
+    // HeaderMap::get(&HeaderName) avoids the per-lookup BytesMut allocation
+    // that HeaderMap::get(&str) triggers for non-standard header names.
+    let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+        nom::Err::Failure(RuleParseError {
+            input,
+            kind: RuleParseErrorKind::InvalidHeaderName {
+                name: name.clone(),
+                reason: e.to_string(),
+            },
+        })
+    })?;
+
+    Ok((
+        input,
+        Expr::Header {
+            name,
+            header_name,
+            value,
+        },
+    ))
 }
 
 /// Parse action: single action or composite (action + action)
@@ -606,7 +639,17 @@ fn parse_key_host(input: &str) -> RResult<'_, KeyExtractor> {
 fn parse_key_header(input: &str) -> RResult<'_, KeyExtractor> {
     let (input, _) = ws(tag_no_case("header"))(input)?;
     let (input, name) = delimited(ws(char('(')), parse_identifier, ws(char(')')))(input)?;
-    Ok((input, KeyExtractor::Header(name.to_string())))
+    let lower = name.to_lowercase();
+    let header_name = HeaderName::from_bytes(lower.as_bytes()).map_err(|e| {
+        nom::Err::Failure(RuleParseError {
+            input,
+            kind: RuleParseErrorKind::InvalidHeaderName {
+                name: lower.clone(),
+                reason: e.to_string(),
+            },
+        })
+    })?;
+    Ok((input, KeyExtractor::Header(header_name, lower)))
 }
 
 /// Parse path key extractor
@@ -705,7 +748,10 @@ mod tests {
         {
             assert_eq!(requests, 100);
             assert_eq!(window_secs, 1);
-            assert!(matches!(key_expr, KeyExpr::Single(KeyExtractor::Header(_))));
+            assert!(matches!(
+                key_expr,
+                KeyExpr::Single(KeyExtractor::Header(..))
+            ));
             assert!(!mangle);
         } else {
             panic!("Expected RateLimit action");
@@ -733,8 +779,8 @@ mod tests {
     #[test]
     fn test_parse_header_with_value() {
         let rule = parse_rule("test", r#"header("X-Auth:secret") = pass"#).unwrap();
-        if let Expr::Header { name, value } = &rule.condition {
-            assert_eq!(name, "X-Auth");
+        if let Expr::Header { name, value, .. } = &rule.condition {
+            assert_eq!(name, "x-auth");
             assert!(matches!(value, Some(HeaderMatch::Exact(v)) if v == "secret"));
         } else {
             panic!("Expected Header expression");
@@ -785,7 +831,10 @@ mod tests {
         {
             assert_eq!(credits, 1000);
             assert_eq!(period, CreditPeriod::Day);
-            assert!(matches!(key_expr, KeyExpr::Single(KeyExtractor::Header(_))));
+            assert!(matches!(
+                key_expr,
+                KeyExpr::Single(KeyExtractor::Header(..))
+            ));
             assert!(!mangle);
         } else {
             panic!("Expected Credit action, got {:?}", rule.action);
@@ -865,11 +914,11 @@ mod tests {
             assert_eq!(period, CreditPeriod::Day);
             assert!(matches!(
                 rate_key_expr,
-                KeyExpr::Single(KeyExtractor::Header(_))
+                KeyExpr::Single(KeyExtractor::Header(..))
             ));
             assert!(matches!(
                 credit_key_expr,
-                KeyExpr::Single(KeyExtractor::Header(_))
+                KeyExpr::Single(KeyExtractor::Header(..))
             ));
             assert!(!mangle);
         } else {
@@ -918,7 +967,7 @@ mod tests {
             assert!(matches!(rate_key_expr, KeyExpr::Composite(_)));
             assert!(matches!(
                 credit_key_expr,
-                KeyExpr::Single(KeyExtractor::Header(_))
+                KeyExpr::Single(KeyExtractor::Header(..))
             ));
         } else {
             panic!("Expected RateLimitCredit action, got {:?}", rule.action);
@@ -951,7 +1000,10 @@ mod tests {
         {
             assert_eq!(requests, 50);
             assert_eq!(window_secs, 1);
-            assert!(matches!(key_expr, KeyExpr::Single(KeyExtractor::Header(_))));
+            assert!(matches!(
+                key_expr,
+                KeyExpr::Single(KeyExtractor::Header(..))
+            ));
             assert!(mangle);
         } else {
             panic!(

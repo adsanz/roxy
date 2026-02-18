@@ -8,7 +8,8 @@ use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
 use http::Method;
-use std::collections::HashMap;
+use http::header::{HeaderMap, HeaderName, HeaderValue};
+use std::net::IpAddr;
 
 // Import from the crate
 use roxy::rules::{EvalContext, RuleIndex};
@@ -125,15 +126,15 @@ fn build_rule_index(rules: &[RuleConfig]) -> RuleIndex {
 fn create_eval_context<'a>(
     host: &'a str,
     path: &'a str,
-    method: Method,
-    headers: &'a HashMap<String, String>,
+    method: &'a Method,
+    headers: &'a HeaderMap,
 ) -> EvalContext<'a> {
     EvalContext {
         host,
         path,
         method,
         headers,
-        client_ip: Some("192.168.1.100"),
+        client_ip: Some(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100))),
     }
 }
 
@@ -166,16 +167,28 @@ fn bench_rule_evaluation(c: &mut Criterion) {
     let mut group = c.benchmark_group("rule_evaluation");
     
     // Test contexts that exercise different code paths
-    let mut headers_with_auth = HashMap::new();
-    headers_with_auth.insert("authorization".to_string(), "Bearer token123".to_string());
-    headers_with_auth.insert("x-customer-id".to_string(), "cust-42".to_string());
-    headers_with_auth.insert("x-request-id-5".to_string(), "req-123".to_string());
+    let mut headers_with_auth = HeaderMap::new();
+    headers_with_auth.insert(
+        HeaderName::from_static("authorization"),
+        HeaderValue::from_static("Bearer token123"),
+    );
+    headers_with_auth.insert(
+        HeaderName::from_static("x-customer-id"),
+        HeaderValue::from_static("cust-42"),
+    );
+    headers_with_auth.insert(
+        HeaderName::from_static("x-request-id-5"),
+        HeaderValue::from_static("req-123"),
+    );
     
-    let mut headers_without_auth = HashMap::new();
-    headers_without_auth.insert("x-customer-id".to_string(), "cust-42".to_string());
+    let mut headers_without_auth = HeaderMap::new();
+    headers_without_auth.insert(
+        HeaderName::from_static("x-customer-id"),
+        HeaderValue::from_static("cust-42"),
+    );
     
     // Test scenarios
-    let scenarios: Vec<(&str, &str, &str, Method, &HashMap<String, String>)> = vec![
+    let scenarios: Vec<(&str, &str, &str, Method, &HeaderMap)> = vec![
         ("match_early", "service-0.example.com", "/api/v1/resource", Method::GET, &headers_with_auth),
         ("match_middle", "api-50.example.com", "/users/50/profile", Method::GET, &headers_with_auth),
         ("match_late", "service-99.internal", "/health", Method::GET, &headers_without_auth),
@@ -188,7 +201,7 @@ fn bench_rule_evaluation(c: &mut Criterion) {
             let index = build_rule_index(&rules);
             
             for (scenario_name, host, path, method, headers) in &scenarios {
-                let ctx = create_eval_context(host, path, method.clone(), headers);
+                let ctx = create_eval_context(host, path, method, headers);
                 
                 group.throughput(Throughput::Elements(1));
                 group.bench_with_input(
@@ -216,7 +229,7 @@ fn bench_bulk_evaluation(c: &mut Criterion) {
     
     // Pre-generate diverse request contexts
     let request_count = 1000;
-    let mut requests: Vec<(String, String, Method, HashMap<String, String>)> = Vec::new();
+    let mut requests: Vec<(String, String, Method, HeaderMap)> = Vec::new();
     
     let methods = [Method::GET, Method::POST, Method::PUT, Method::DELETE];
     let domains = ["example.com", "api.internal", "cdn.test.net", "backend.local"];
@@ -226,12 +239,21 @@ fn bench_bulk_evaluation(c: &mut Criterion) {
         let path = format!("/api/v{}/users/{}/action", (i % 3) + 1, i);
         let method = methods[i % methods.len()].clone();
         
-        let mut headers = HashMap::new();
+        let mut headers = HeaderMap::new();
         if i % 3 == 0 {
-            headers.insert("authorization".to_string(), format!("Bearer token-{}", i));
+            headers.insert(
+                HeaderName::from_static("authorization"),
+                HeaderValue::from_str(&format!("Bearer token-{}", i)).unwrap(),
+            );
         }
-        headers.insert("x-customer-id".to_string(), format!("cust-{}", i % 1000));
-        headers.insert("x-request-id".to_string(), format!("req-{}", i));
+        headers.insert(
+            HeaderName::from_static("x-customer-id"),
+            HeaderValue::from_str(&format!("cust-{}", i % 1000)).unwrap(),
+        );
+        headers.insert(
+            HeaderName::from_static("x-request-id"),
+            HeaderValue::from_str(&format!("req-{}", i)).unwrap(),
+        );
         
         requests.push((host, path, method, headers));
     }
@@ -254,9 +276,9 @@ fn bench_bulk_evaluation(c: &mut Criterion) {
                             let ctx = EvalContext {
                                 host,
                                 path,
-                                method: method.clone(),
+                                method,
                                 headers,
-                                client_ip: Some("10.0.0.1"),
+                                client_ip: Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))),
                             };
                             black_box(index.evaluate(&ctx));
                         }
@@ -290,14 +312,17 @@ fn bench_mangle_evaluation(c: &mut Criterion) {
     
     let index = build_rule_index(&rules);
     
-    let mut headers = HashMap::new();
-    headers.insert("x-customer-id".to_string(), "cust-42".to_string());
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("x-customer-id"),
+        HeaderValue::from_static("cust-42"),
+    );
     
     // Context that matches mangle rules
-    let ctx_match = create_eval_context("backend-5.internal", "/api/data", Method::POST, &headers);
+    let ctx_match = create_eval_context("backend-5.internal", "/api/data", &Method::POST, &headers);
     
     // Context that doesn't match
-    let ctx_nomatch = create_eval_context("api.example.com", "/users", Method::GET, &headers);
+    let ctx_nomatch = create_eval_context("api.example.com", "/users", &Method::GET, &headers);
     
     group.bench_function("mangle_match", |b| {
         b.iter(|| {

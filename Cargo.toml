@@ -36,6 +36,11 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
+# Global allocator — jemalloc actively defragments, unlike glibc malloc
+# which retains high-water RSS indefinitely.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 # HTTP types (re-exported by hudsucker but we need them directly)
 http = "1"
 hyper = "1"

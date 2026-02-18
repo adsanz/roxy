@@ -3,11 +3,11 @@
 //! Implements the request processing pipeline:
 //! handle_request → [rules evaluation] → [rate limiting] → [header mangle] → forward
 
-use http::Method;
 use hudsucker::{
     Body, HttpContext, HttpHandler, RequestOrResponse,
     hyper::{Request, Response, StatusCode},
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -15,8 +15,28 @@ use tracing::{debug, info};
 use crate::config::{HeaderMangleConfig, ThrottleConfig};
 use crate::ratelimit::{CreditManager, CreditResult, RateLimitResult, RateLimiter};
 use crate::rules::{
-    Action, EvalContext, KeyExpr, RuleIndex, RuleMatch, extract_ip_key, extract_key,
+    Action, EvalContext, KeyExpr, LoggedHeaders, RuleIndex, RuleMatch, extract_ip_key, extract_key,
 };
+
+/// Pre-parsed header to add (parsed once at startup, not per-request).
+#[derive(Clone, Debug)]
+struct ParsedHeaderAdd {
+    name: http::HeaderName,
+    value: http::HeaderValue,
+}
+
+/// Pre-parsed header to remove (parsed once at startup, not per-request).
+#[derive(Clone, Debug)]
+struct ParsedHeaderRemove {
+    name: http::HeaderName,
+}
+
+/// Pre-parsed header mangle config (no per-request `.parse()` calls).
+#[derive(Clone, Debug)]
+struct ParsedMangleConfig {
+    add: Vec<ParsedHeaderAdd>,
+    remove: Vec<ParsedHeaderRemove>,
+}
 
 /// Roxy HTTP handler implementing Hudsucker's HttpHandler trait.
 #[derive(Clone)]
@@ -30,8 +50,8 @@ pub struct RoxyHandler {
     /// Credit manager
     credit_manager: Arc<CreditManager>,
 
-    /// Header mangle configurations keyed by rule name
-    header_configs: Arc<HashMap<String, Vec<HeaderMangleConfig>>>,
+    /// Header mangle configurations keyed by rule name (pre-parsed at startup)
+    header_configs: Arc<HashMap<String, Vec<ParsedMangleConfig>>>,
 
     /// Throttle configs indexed by rule name
     throttle_configs: Arc<HashMap<String, ThrottleConfig>>,
@@ -46,14 +66,33 @@ impl RoxyHandler {
         header_configs: Vec<HeaderMangleConfig>,
         throttle_configs: Vec<ThrottleConfig>,
     ) -> Self {
-        // Index header configs by rule name for fast lookup
-        let mut configs_by_rule: HashMap<String, Vec<HeaderMangleConfig>> = HashMap::new();
+        // Index header configs by rule name and pre-parse header names/values
+        let mut configs_by_rule: HashMap<String, Vec<ParsedMangleConfig>> = HashMap::new();
         for config in header_configs {
+            let parsed = ParsedMangleConfig {
+                add: config
+                    .add
+                    .iter()
+                    .filter_map(|h| {
+                        let name = h.name.parse::<http::HeaderName>().ok()?;
+                        let value = h.value.parse::<http::HeaderValue>().ok()?;
+                        Some(ParsedHeaderAdd { name, value })
+                    })
+                    .collect(),
+                remove: config
+                    .remove
+                    .iter()
+                    .filter_map(|h| {
+                        let name = h.parse::<http::HeaderName>().ok()?;
+                        Some(ParsedHeaderRemove { name })
+                    })
+                    .collect(),
+            };
             for rule_name in &config.rules {
                 configs_by_rule
                     .entry(rule_name.clone())
                     .or_default()
-                    .push(config.clone());
+                    .push(parsed.clone());
             }
         }
 
@@ -72,56 +111,29 @@ impl RoxyHandler {
         }
     }
 
-    /// Extract request info into evaluation context.
-    fn build_eval_context<'a>(
-        host: &'a str,
-        path: &'a str,
-        method: Method,
-        headers: &'a HashMap<String, String>,
-        client_ip: Option<&'a str>,
-    ) -> EvalContext<'a> {
-        EvalContext {
-            host,
-            path,
-            method,
-            headers,
-            client_ip,
-        }
-    }
-
-    /// Extract headers from request into a HashMap.
-    fn extract_headers<T>(req: &Request<T>) -> HashMap<String, String> {
-        let mut headers = HashMap::new();
-        for (name, value) in req.headers().iter() {
-            if let Ok(v) = value.to_str() {
-                headers.insert(name.as_str().to_lowercase(), v.to_string());
-            } else {
-                // Header contains non-ASCII bytes, use lossy conversion
-                let v = String::from_utf8_lossy(value.as_bytes()).to_string();
-                debug!(target: "proxy", header = %name, "Header contains non-UTF8 bytes, using lossy conversion");
-                headers.insert(name.as_str().to_lowercase(), v);
-            }
-        }
-        headers
-    }
-
     /// Parse host and path from request.
-    fn parse_request_info<T>(req: &Request<T>) -> (String, String) {
+    /// Host is returned as `Cow<str>`: borrowed when available from URI authority
+    /// (zero-alloc), owned only when extracted from Host header (port stripping).
+    fn parse_request_info<T>(req: &Request<T>) -> (Cow<'_, str>, &str) {
         let uri = req.uri();
 
-        // Get host from URI authority or Host header
-        let host = uri
-            .authority()
-            .map(|a| a.host().to_string())
-            .or_else(|| {
-                req.headers()
-                    .get("host")
-                    .and_then(|h| h.to_str().ok())
-                    .map(|h| h.split(':').next().unwrap_or(h).to_string())
-            })
-            .unwrap_or_else(|| "localhost".to_string());
+        // Get host: prefer URI authority (borrowed), fall back to Host header (may allocate for port strip)
+        let host: Cow<'_, str> = if let Some(authority) = uri.authority() {
+            Cow::Borrowed(authority.host())
+        } else if let Some(h) = req.headers().get("host").and_then(|h| h.to_str().ok()) {
+            if let Some(host_part) = h.split(':').next()
+                && host_part != h
+            {
+                // Host header has port — need to allocate the stripped version
+                Cow::Owned(host_part.to_string())
+            } else {
+                Cow::Borrowed(h)
+            }
+        } else {
+            Cow::Borrowed("localhost")
+        };
 
-        let path = uri.path().to_string();
+        let path = uri.path();
 
         (host, path)
     }
@@ -153,7 +165,7 @@ impl RoxyHandler {
             return None; // No user-controlled components, no need for baseline
         }
         let ip_key = extract_ip_key(rule_name, ctx);
-        Some(self.rate_limiter.check(&ip_key, requests, window_secs))
+        Some(self.rate_limiter.check(ip_key.as_str(), requests, window_secs))
     }
 
     /// Build an HTTP error/rejection response.
@@ -204,15 +216,14 @@ impl HttpHandler for RoxyHandler {
     async fn handle_request(&mut self, ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
         let method = req.method().clone();
         let (host, path) = Self::parse_request_info(&req);
-        let headers = Self::extract_headers(&req);
 
-        // Get client IP
-        let client_ip = ctx.client_addr.ip().to_string();
+        // Get client IP as IpAddr (no formatting unless needed)
+        let client_ip = ctx.client_addr.ip();
 
         // For CONNECT requests (HTTPS tunnel establishment), skip rule evaluation.
         // Rules will be evaluated on the actual HTTP request inside the tunnel.
         // This allows path-based rules to work correctly for HTTPS traffic.
-        if method == Method::CONNECT {
+        if method == http::Method::CONNECT {
             debug!(
                 target: "proxy",
                 method = %method,
@@ -231,9 +242,14 @@ impl HttpHandler for RoxyHandler {
             "Processing request"
         );
 
-        // Build evaluation context
-        let eval_ctx =
-            Self::build_eval_context(&host, &path, method.clone(), &headers, Some(&client_ip));
+        // Build evaluation context — pass headers by reference, no copy
+        let eval_ctx = EvalContext {
+            host: &host,
+            path,
+            method: &method,
+            headers: req.headers(),
+            client_ip: Some(client_ip),
+        };
 
         // Evaluate rules
         let result = self.rules.evaluate(&eval_ctx);
@@ -242,8 +258,8 @@ impl HttpHandler for RoxyHandler {
         debug!(target: "rules", ?result, "Rule evaluation result");
 
         // Process rule result - collect info for single log at forward time
-        let mut matched_rule: Option<String> = None;
-        let mut matched_headers: HashMap<String, String> = HashMap::new();
+        let mut matched_rule: Option<&str> = None;
+        let mut matched_headers = LoggedHeaders::default();
 
         if let Some(rule_match) = result {
             let RuleMatch {
@@ -284,7 +300,7 @@ impl HttpHandler for RoxyHandler {
                 } => {
                     // IP baseline check: prevent bypass by varying header values
                     if let Some(RateLimitResult::Limited { retry_after_secs }) = self
-                        .check_ip_baseline(&rule_name, &key_expr, requests, window_secs, &eval_ctx)
+                        .check_ip_baseline(rule_name, key_expr, *requests, *window_secs, &eval_ctx)
                     {
                         info!(
                             target: "proxy",
@@ -306,10 +322,10 @@ impl HttpHandler for RoxyHandler {
                     }
 
                     // Per-key rate limit check
-                    match self.check_rate_limit(&key_expr, requests, window_secs, &eval_ctx) {
+                    match self.check_rate_limit(key_expr, *requests, *window_secs, &eval_ctx) {
                         RateLimitResult::Allowed { remaining } => {
                             if let Some(delay_ms) =
-                                self.compute_throttle_delay(&rule_name, remaining, requests)
+                                self.compute_throttle_delay(rule_name, remaining, *requests)
                             {
                                 debug!(target: "ratelimit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
@@ -317,8 +333,8 @@ impl HttpHandler for RoxyHandler {
                             } else {
                                 debug!(target: "ratelimit", rule = %rule_name, remaining);
                             }
-                            if mangle {
-                                mangle_rules.push(rule_name.clone());
+                            if *mangle {
+                                mangle_rules.push_name(rule_name);
                             }
                             matched_rule = Some(rule_name);
                             matched_headers = logged_headers;
@@ -346,13 +362,13 @@ impl HttpHandler for RoxyHandler {
                 Action::Credit {
                     key_expr, mangle, ..
                 } => {
-                    let key = extract_key(&key_expr, &eval_ctx);
-                    let credit_result = self.credit_manager.check(&rule_name, &key);
+                    let key = extract_key(key_expr, &eval_ctx);
+                    let credit_result = self.credit_manager.check(rule_name, &key);
                     match credit_result {
                         CreditResult::Allowed { remaining } => {
                             debug!(target: "credit", rule = %rule_name, remaining);
-                            if mangle {
-                                mangle_rules.push(rule_name.clone());
+                            if *mangle {
+                                mangle_rules.push_name(rule_name);
                             }
                             matched_rule = Some(rule_name);
                             matched_headers = logged_headers;
@@ -363,8 +379,8 @@ impl HttpHandler for RoxyHandler {
                         } => {
                             debug!(target: "credit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
                             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            if mangle {
-                                mangle_rules.push(rule_name.clone());
+                            if *mangle {
+                                mangle_rules.push_name(rule_name);
                             }
                             matched_rule = Some(rule_name);
                             matched_headers = logged_headers;
@@ -375,7 +391,7 @@ impl HttpHandler for RoxyHandler {
                         } => {
                             let message = self
                                 .credit_manager
-                                .format_exhaustion_message(&rule_name, &reset_time);
+                                .format_exhaustion_message(rule_name, &reset_time);
                             info!(
                                 target: "proxy",
                                 method = %method,
@@ -407,10 +423,10 @@ impl HttpHandler for RoxyHandler {
                     // Step 0: IP baseline check (prevents header-flooding bypass)
                     if let Some(RateLimitResult::Limited { retry_after_secs }) = self
                         .check_ip_baseline(
-                            &rule_name,
-                            &rate_key_expr,
-                            requests,
-                            window_secs,
+                            rule_name,
+                            rate_key_expr,
+                            *requests,
+                            *window_secs,
                             &eval_ctx,
                         )
                     {
@@ -434,7 +450,7 @@ impl HttpHandler for RoxyHandler {
                     }
 
                     // Step 1: Per-key rate limit check (burst protection)
-                    match self.check_rate_limit(&rate_key_expr, requests, window_secs, &eval_ctx) {
+                    match self.check_rate_limit(rate_key_expr, *requests, *window_secs, &eval_ctx) {
                         RateLimitResult::Limited { retry_after_secs } => {
                             info!(
                                 target: "proxy",
@@ -455,8 +471,8 @@ impl HttpHandler for RoxyHandler {
                         }
                         RateLimitResult::Allowed { remaining } => {
                             // Step 2: Credit check (budget enforcement)
-                            let credit_key = extract_key(&credit_key_expr, &eval_ctx);
-                            let credit_result = self.credit_manager.check(&rule_name, &credit_key);
+                            let credit_key = extract_key(credit_key_expr, &eval_ctx);
+                            let credit_result = self.credit_manager.check(rule_name, &credit_key);
                             match credit_result {
                                 CreditResult::Exhausted {
                                     retry_after_secs,
@@ -464,7 +480,7 @@ impl HttpHandler for RoxyHandler {
                                 } => {
                                     let message = self
                                         .credit_manager
-                                        .format_exhaustion_message(&rule_name, &reset_time);
+                                        .format_exhaustion_message(rule_name, &reset_time);
                                     info!(
                                         target: "proxy",
                                         method = %method,
@@ -488,21 +504,21 @@ impl HttpHandler for RoxyHandler {
                                     delay_ms: credit_delay,
                                 } => {
                                     let rl_delay = self
-                                        .compute_throttle_delay(&rule_name, remaining, requests)
+                                        .compute_throttle_delay(rule_name, remaining, *requests)
                                         .unwrap_or(0);
                                     let max_delay = credit_delay.max(rl_delay);
                                     debug!(target: "proxy", rule = %rule_name, credit_delay, rl_delay, max_delay, "Composite throttle");
                                     tokio::time::sleep(std::time::Duration::from_millis(max_delay))
                                         .await;
-                                    if mangle {
-                                        mangle_rules.push(rule_name.clone());
+                                    if *mangle {
+                                        mangle_rules.push_name(rule_name);
                                     }
                                     matched_rule = Some(rule_name);
                                     matched_headers = logged_headers;
                                 }
                                 CreditResult::Allowed { remaining: _ } => {
                                     if let Some(delay_ms) =
-                                        self.compute_throttle_delay(&rule_name, remaining, requests)
+                                        self.compute_throttle_delay(rule_name, remaining, *requests)
                                     {
                                         debug!(target: "ratelimit", rule = %rule_name, remaining, delay_ms, "Throttling (soft limit)");
                                         tokio::time::sleep(std::time::Duration::from_millis(
@@ -510,8 +526,8 @@ impl HttpHandler for RoxyHandler {
                                         ))
                                         .await;
                                     }
-                                    if mangle {
-                                        mangle_rules.push(rule_name.clone());
+                                    if *mangle {
+                                        mangle_rules.push_name(rule_name);
                                     }
                                     matched_rule = Some(rule_name);
                                     matched_headers = logged_headers;
@@ -525,54 +541,60 @@ impl HttpHandler for RoxyHandler {
             debug!(target: "rules", "No rules matched");
         }
 
+        // Log the forwarded request before destructuring (host/path borrow from req)
+        if matched_headers.is_empty() {
+            info!(
+                target: "proxy",
+                method = %method,
+                host = %host,
+                path = %path,
+                rule = ?matched_rule,
+                action = "forward",
+            );
+        } else {
+            info!(
+                target: "proxy",
+                method = %method,
+                host = %host,
+                path = %path,
+                rule = ?matched_rule,
+                action = "forward",
+                headers = ?matched_headers
+            );
+        }
+
         // Apply header modifications for matched mangle rules
         let (mut parts, body) = req.into_parts();
 
-        for rule_name in &mangle_rules {
+        for rule_name in mangle_rules.iter() {
             if let Some(configs) = self.header_configs.get(rule_name) {
                 for config in configs {
-                    // Add headers
+                    // Add headers (pre-parsed at startup, just clone name/value)
                     for header_add in &config.add {
-                        if let Ok(name) = header_add.name.parse::<http::HeaderName>()
-                            && let Ok(value) = header_add.value.parse::<http::HeaderValue>()
-                        {
-                            parts.headers.insert(name, value);
-                            debug!(
-                                target: "proxy",
-                                rule = %rule_name,
-                                header = %header_add.name,
-                                value = %header_add.value,
-                                "Added header"
-                            );
-                        }
+                        parts
+                            .headers
+                            .insert(header_add.name.clone(), header_add.value.clone());
+                        debug!(
+                            target: "proxy",
+                            rule = %rule_name,
+                            header = %header_add.name,
+                            "Added header"
+                        );
                     }
 
-                    // Remove headers
-                    for header_name in &config.remove {
-                        if let Ok(name) = header_name.parse::<http::HeaderName>() {
-                            parts.headers.remove(name);
-                            debug!(
-                                target: "proxy",
-                                rule = %rule_name,
-                                header = %header_name,
-                                "Removed header"
-                            );
-                        }
+                    // Remove headers (pre-parsed at startup)
+                    for header_rm in &config.remove {
+                        parts.headers.remove(&header_rm.name);
+                        debug!(
+                            target: "proxy",
+                            rule = %rule_name,
+                            header = %header_rm.name,
+                            "Removed header"
+                        );
                     }
                 }
             }
         }
-
-        // Log the forwarded request (single info log per request)
-        info!(
-            target: "proxy",
-            method = %method,
-            host = %host,
-            path = %path,
-            rule = ?matched_rule,
-            action = "forward",
-            headers = ?matched_headers
-        );
 
         // Reconstruct request and forward
         Request::from_parts(parts, body).into()
@@ -600,7 +622,7 @@ mod tests {
             .unwrap();
 
         let (host, path) = RoxyHandler::parse_request_info(&req);
-        assert_eq!(host, "example.com");
+        assert_eq!(host.as_ref(), "example.com");
         assert_eq!(path, "/path/to/resource");
     }
 
@@ -613,25 +635,8 @@ mod tests {
             .unwrap();
 
         let (host, path) = RoxyHandler::parse_request_info(&req);
-        assert_eq!(host, "api.example.com");
+        assert_eq!(host.as_ref(), "api.example.com");
         assert_eq!(path, "/api/endpoint");
-    }
-
-    #[test]
-    fn test_extract_headers() {
-        let req = Request::builder()
-            .uri("http://example.com/")
-            .header("X-Custom", "value")
-            .header("Content-Type", "application/json")
-            .body(())
-            .unwrap();
-
-        let headers = RoxyHandler::extract_headers(&req);
-        assert_eq!(headers.get("x-custom"), Some(&"value".to_string()));
-        assert_eq!(
-            headers.get("content-type"),
-            Some(&"application/json".to_string())
-        );
     }
 
     #[test]

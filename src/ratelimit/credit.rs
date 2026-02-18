@@ -8,6 +8,8 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Timelike, Utc, Weekday};
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::util::StackString;
+
 /// Result of a credit check.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CreditResult {
@@ -172,7 +174,7 @@ impl ResetSchedule {
     /// Format epoch seconds as "YYYY-MM-DDTHH:MM:SSZ".
     pub fn format_reset_time(epoch_secs: u64) -> String {
         DateTime::from_timestamp(epoch_secs as i64, 0)
-            .expect("BUG: epoch timestamp out of representable range")
+            .expect("BUG Open an issue at https://github.com/adsanz/roxy/issues: epoch timestamp out of representable range")
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string()
     }
@@ -208,9 +210,14 @@ impl CreditManager {
     }
 
     /// Check credits for a request. Consumes one credit if allowed.
+    ///
+    /// Uses a two-phase DashMap lookup to avoid heap allocation
+    /// for existing buckets (the common case after warmup):
+    /// 1. `get_mut(&str)` with a stack-formatted key — zero heap alloc
+    /// 2. `entry(String)` only for first-time keys
     pub fn check(&self, rule_name: &str, key: &str) -> CreditResult {
-        let config = match self.configs.get(rule_name) {
-            Some(c) => c.clone(),
+        let config_ref = match self.configs.get(rule_name) {
+            Some(c) => c,
             None => {
                 return CreditResult::Allowed {
                     remaining: u64::MAX,
@@ -220,18 +227,51 @@ impl CreditManager {
 
         let now_epoch = u64::try_from(Utc::now().timestamp())
             .expect("system clock is before Unix epoch — check NTP");
-        let bucket_key = format!("{}:{}", rule_name, key);
+
+        // Fast path: format key on the stack and try get_mut — zero heap alloc
+        let total_len = rule_name.len() + 1 + key.len();
+        let mut stack_key = StackString::<128>::new();
+        let fits_stack = stack_key.push_str(rule_name).is_ok()
+            && stack_key.push(':').is_ok()
+            && stack_key.push_str(key).is_ok();
+
+        if fits_stack
+            && let Some(mut entry) = self.buckets.get_mut(stack_key.as_str()) {
+                let bucket = entry.value_mut();
+                return Self::check_bucket(bucket, &config_ref, now_epoch);
+            }
+
+        // Slow path: key not found (or too long for stack) — allocate String for entry()
+        let bucket_key = if fits_stack {
+            // Key fit on stack but wasn't in the map — copy to String for insertion
+            stack_key.as_str().to_owned()
+        } else {
+            let mut s = String::with_capacity(total_len);
+            s.push_str(rule_name);
+            s.push(':');
+            s.push_str(key);
+            s
+        };
 
         let mut entry = self
             .buckets
             .entry(bucket_key)
             .or_insert_with(|| CreditBucket {
                 used: AtomicU64::new(0),
-                reset_at: AtomicU64::new(config.schedule.next_reset_after(now_epoch)),
+                reset_at: AtomicU64::new(config_ref.schedule.next_reset_after(now_epoch)),
                 last_access: AtomicU64::new(now_epoch),
             });
 
         let bucket = entry.value_mut();
+        Self::check_bucket(bucket, &config_ref, now_epoch)
+    }
+
+    /// Core credit check logic, factored out so both fast-path and slow-path use it.
+    fn check_bucket(
+        bucket: &CreditBucket,
+        config: &CreditRuleConfig,
+        now_epoch: u64,
+    ) -> CreditResult {
         bucket.last_access.store(now_epoch, Ordering::Relaxed);
 
         // Reset if past deadline
@@ -285,12 +325,26 @@ impl CreditManager {
         }
     }
 
-    /// Remove buckets not accessed in 48 hours.
+    /// Remove stale credit buckets.
+    ///
+    /// A bucket is only removed when BOTH conditions hold:
+    /// 1. The credit window has ended (`now >= reset_at`)
+    /// 2. The bucket hasn't been accessed in 48 hours
+    ///
+    /// This prevents premature removal of weekly/monthly buckets during
+    /// their active window — a user who goes silent for >48h within a
+    /// 7-day window must still have their usage tracked.
     pub fn force_cleanup(&self) {
         let now_epoch = u64::try_from(Utc::now().timestamp())
             .expect("system clock is before Unix epoch — check NTP");
         let expiry_secs = 48 * 3600;
         self.buckets.retain(|_, bucket| {
+            let reset_at = bucket.reset_at.load(Ordering::Relaxed);
+            // Keep bucket if we're still in the active credit window
+            if now_epoch < reset_at {
+                return true;
+            }
+            // Past reset: safe to remove if not accessed recently
             now_epoch.saturating_sub(bucket.last_access.load(Ordering::Relaxed)) < expiry_secs
         });
         self.buckets.shrink_to_fit();
@@ -521,10 +575,63 @@ mod tests {
         manager.check("test-rule", "user-1");
         assert_eq!(manager.buckets.len(), 1);
 
+        // Simulate: last_access long ago AND reset_at in the past (window closed)
         if let Some(entry) = manager.buckets.get_mut("test-rule:user-1") {
             entry.last_access.store(0, Ordering::Relaxed);
+            entry.reset_at.store(0, Ordering::Relaxed);
         }
         manager.force_cleanup();
         assert_eq!(manager.buckets.len(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_preserves_active_window_buckets() {
+        // Regression: weekly credit bucket must survive >48h of inactivity
+        // within the same credit window.
+        let manager = CreditManager::new();
+        manager.register_rule(
+            "weekly-rule".into(),
+            CreditRuleConfig {
+                budget: 1000,
+                soft_limit: None,
+                max_delay_ms: 0,
+                schedule: ResetSchedule::Weekly {
+                    day: Weekday::Mon,
+                    hour: 0,
+                    minute: 0,
+                },
+                message: "Out of credits".to_string(),
+            },
+        );
+
+        // User makes requests, consuming credits
+        for _ in 0..5 {
+            manager.check("weekly-rule", "user-1");
+        }
+        assert_eq!(manager.buckets.len(), 1);
+
+        // Simulate: last_access was 3 days ago (>48h) but reset_at is still in the future
+        let now_epoch = u64::try_from(Utc::now().timestamp()).unwrap();
+        let three_days_ago = now_epoch - (3 * 24 * 3600);
+        if let Some(entry) = manager.buckets.get_mut("weekly-rule:user-1") {
+            entry.last_access.store(three_days_ago, Ordering::Relaxed);
+            // reset_at is already in the future (set by check()), leave it
+        }
+
+        // Cleanup must NOT remove the bucket — we're still in the credit window
+        manager.force_cleanup();
+        assert_eq!(
+            manager.buckets.len(),
+            1,
+            "bucket removed during active credit window — weekly credits would reset!"
+        );
+
+        // Verify the 5 consumed credits are still tracked
+        let result = manager.check("weekly-rule", "user-1");
+        assert!(
+            matches!(result, CreditResult::Allowed { remaining: 994 }),
+            "expected 994 remaining (5 used + 1 from this check), got {:?}",
+            result,
+        );
     }
 }

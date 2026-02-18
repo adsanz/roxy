@@ -4,6 +4,8 @@
 
 use globset::GlobMatcher;
 use http::Method;
+use http::header::{HeaderMap, HeaderName};
+use std::net::IpAddr;
 
 /// A compiled rule ready for evaluation.
 #[derive(Debug)]
@@ -22,6 +24,12 @@ pub struct CompiledRule {
 
     /// Extracted method for indexing (if rule has simple method check)
     pub indexed_method: Option<Method>,
+
+    /// Pre-computed header names for existence-only checks (logging).
+    /// Stores (HeaderName, String) pairs: HeaderName for zero-alloc lookup,
+    /// String for the key in the logged headers HashMap.
+    /// Computed once at rule compile time to avoid per-request AST traversal.
+    pub logged_header_names: Vec<(HeaderName, String)>,
 }
 
 /// Expression AST node.
@@ -41,7 +49,11 @@ pub enum Expr {
     /// header("X-Auth:value") - value match
     /// header("X-Auth~regex") - regex match (future)
     Header {
+        /// Original (lowercased) name string — used for logging and key extraction
         name: String,
+        /// Pre-computed HeaderName for zero-alloc HeaderMap lookups.
+        /// Avoids per-evaluation `HeaderName::from_bytes()` heap allocation.
+        header_name: HeaderName,
         value: Option<HeaderMatch>,
     },
 
@@ -145,10 +157,10 @@ impl KeyExpr {
     /// Header-based keys are user-controlled and require IP baseline enforcement.
     pub fn has_header_extractor(&self) -> bool {
         match self {
-            KeyExpr::Single(e) => matches!(e, KeyExtractor::Header(_)),
+            KeyExpr::Single(e) => matches!(e, KeyExtractor::Header(..)),
             KeyExpr::Composite(extractors) => extractors
                 .iter()
-                .any(|e| matches!(e, KeyExtractor::Header(_))),
+                .any(|e| matches!(e, KeyExtractor::Header(..))),
         }
     }
 }
@@ -159,8 +171,10 @@ pub enum KeyExtractor {
     /// Extract from host (full value)
     Host,
 
-    /// Extract from header value
-    Header(String),
+    /// Extract from header value.
+    /// Stores pre-computed HeaderName for zero-alloc HeaderMap lookups
+    /// alongside the original String for key formatting.
+    Header(HeaderName, String),
 
     /// Extract from path (full value)
     Path,
@@ -173,12 +187,25 @@ impl CompiledRule {
     /// Create a new compiled rule.
     pub fn new(name: String, condition: Expr, action: Action, else_action: Option<Action>) -> Self {
         let indexed_method = Self::extract_indexed_method(&condition);
+        // Pre-compute (HeaderName, String) pairs for logging.
+        // HeaderName enables zero-alloc HeaderMap lookups, String is the logged key.
+        let logged_header_names: Vec<(HeaderName, String)> = condition
+            .collect_existence_headers()
+            .into_iter()
+            .filter_map(|h| {
+                let lower = h.to_lowercase();
+                HeaderName::from_bytes(lower.as_bytes())
+                    .ok()
+                    .map(|hn| (hn, lower))
+            })
+            .collect();
         Self {
             name,
             condition,
             action,
             else_action,
             indexed_method,
+            logged_header_names,
         }
     }
 
@@ -200,12 +227,6 @@ impl CompiledRule {
             _ => None,
         }
     }
-
-    /// Extract header names that are existence-only checks (no value matcher).
-    /// These headers will be logged when the rule matches.
-    pub fn extract_logged_headers(&self) -> Vec<String> {
-        self.condition.collect_existence_headers()
-    }
 }
 
 impl Expr {
@@ -219,7 +240,9 @@ impl Expr {
 
     fn collect_existence_headers_recursive(&self, headers: &mut Vec<String>) {
         match self {
-            Expr::Header { name, value: None } => {
+            Expr::Header {
+                name, value: None, ..
+            } => {
                 // Only collect headers that are existence checks (no value matcher)
                 headers.push(name.clone());
             }
@@ -242,7 +265,7 @@ impl Expr {
             Expr::Host(glob) => format!("host(\"{}\")", glob.glob().glob()),
             Expr::Path(glob) => format!("path(\"{}\")", glob.glob().glob()),
             Expr::Method(m) => format!("method({})", m),
-            Expr::Header { name, value } => match value {
+            Expr::Header { name, value, .. } => match value {
                 None => format!("header(\"{}\")", name),
                 Some(HeaderMatch::Exact(v)) => format!("header(\"{}:{}\")", name, v),
                 Some(HeaderMatch::Glob(g)) => {
@@ -269,12 +292,18 @@ impl Expr {
             Expr::Host(glob) => glob.is_match(ctx.host),
             Expr::Path(glob) => glob.is_match(ctx.path),
             Expr::Method(m) => ctx.method == m,
-            Expr::Header { name, value } => {
-                if let Some(header_value) = ctx.headers.get(name.to_lowercase().as_str()) {
+            Expr::Header {
+                header_name, value, ..
+            } => {
+                // Use pre-computed HeaderName for zero-alloc HeaderMap lookup.
+                // HeaderMap::get(&HeaderName) does a direct hash probe without
+                // the temporary BytesMut allocation that get(&str) requires.
+                if let Some(header_value) = ctx.headers.get(header_name) {
+                    let header_str = header_value.to_str().unwrap_or("");
                     match value {
                         None => true, // Just existence check
-                        Some(HeaderMatch::Exact(expected)) => header_value == expected,
-                        Some(HeaderMatch::Glob(glob)) => glob.is_match(header_value),
+                        Some(HeaderMatch::Exact(expected)) => header_str == expected,
+                        Some(HeaderMatch::Glob(glob)) => glob.is_match(header_str),
                     }
                 } else {
                     false
@@ -298,16 +327,16 @@ impl Expr {
 pub struct EvalContext<'a> {
     pub host: &'a str,
     pub path: &'a str,
-    pub method: Method,
-    pub headers: &'a std::collections::HashMap<String, String>,
-    pub client_ip: Option<&'a str>,
+    pub method: &'a Method,
+    pub headers: &'a HeaderMap,
+    pub client_ip: Option<IpAddr>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use globset::Glob;
-    use std::collections::HashMap;
+    use http::header::{HeaderMap, HeaderName, HeaderValue};
 
     fn make_glob(pattern: &str) -> GlobMatcher {
         Glob::new(pattern).unwrap().compile_matcher()
@@ -316,11 +345,11 @@ mod tests {
     #[test]
     fn test_host_match() {
         let expr = Expr::Host(make_glob("*.example.com"));
-        let headers = HashMap::new();
+        let headers = HeaderMap::new();
         let ctx = EvalContext {
             host: "api.example.com",
             path: "/",
-            method: Method::GET,
+            method: &Method::GET,
             headers: &headers,
             client_ip: None,
         };
@@ -329,7 +358,7 @@ mod tests {
         let ctx2 = EvalContext {
             host: "other.com",
             path: "/",
-            method: Method::GET,
+            method: &Method::GET,
             headers: &headers,
             client_ip: None,
         };
@@ -342,11 +371,11 @@ mod tests {
             Box::new(Expr::Host(make_glob("never.match"))),
             Box::new(Expr::Path(make_glob("*"))), // This shouldn't be evaluated
         );
-        let headers = HashMap::new();
+        let headers = HeaderMap::new();
         let ctx = EvalContext {
             host: "other.com",
             path: "/test",
-            method: Method::GET,
+            method: &Method::GET,
             headers: &headers,
             client_ip: None,
         };
@@ -359,11 +388,11 @@ mod tests {
             Box::new(Expr::Host(make_glob("*.com"))),
             Box::new(Expr::Path(make_glob("never"))), // This shouldn't be evaluated
         );
-        let headers = HashMap::new();
+        let headers = HeaderMap::new();
         let ctx = EvalContext {
             host: "test.com",
             path: "/test",
-            method: Method::GET,
+            method: &Method::GET,
             headers: &headers,
             client_ip: None,
         };
@@ -373,16 +402,20 @@ mod tests {
     #[test]
     fn test_header_existence() {
         let expr = Expr::Header {
-            name: "X-Auth".to_string(),
+            name: "x-auth".to_string(),
+            header_name: HeaderName::from_static("x-auth"),
             value: None,
         };
-        let mut headers = HashMap::new();
-        headers.insert("x-auth".to_string(), "token123".to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-auth"),
+            HeaderValue::from_static("token123"),
+        );
 
         let ctx = EvalContext {
             host: "test.com",
             path: "/",
-            method: Method::GET,
+            method: &Method::GET,
             headers: &headers,
             client_ip: None,
         };
@@ -392,16 +425,20 @@ mod tests {
     #[test]
     fn test_header_value_match() {
         let expr = Expr::Header {
-            name: "X-Auth".to_string(),
+            name: "x-auth".to_string(),
+            header_name: HeaderName::from_static("x-auth"),
             value: Some(HeaderMatch::Exact("secret".to_string())),
         };
-        let mut headers = HashMap::new();
-        headers.insert("x-auth".to_string(), "secret".to_string());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-auth"),
+            HeaderValue::from_static("secret"),
+        );
 
         let ctx = EvalContext {
             host: "test.com",
             path: "/",
-            method: Method::GET,
+            method: &Method::GET,
             headers: &headers,
             client_ip: None,
         };
@@ -411,15 +448,16 @@ mod tests {
     #[test]
     fn test_not_expression() {
         let expr = Expr::Not(Box::new(Expr::Header {
-            name: "X-Auth".to_string(),
+            name: "x-auth".to_string(),
+            header_name: HeaderName::from_static("x-auth"),
             value: None,
         }));
-        let headers = HashMap::new(); // No headers
+        let headers = HeaderMap::new(); // No headers
 
         let ctx = EvalContext {
             host: "test.com",
             path: "/",
-            method: Method::GET,
+            method: &Method::GET,
             headers: &headers,
             client_ip: None,
         };
@@ -430,18 +468,20 @@ mod tests {
     fn test_collect_existence_headers_simple() {
         // Single existence check
         let expr = Expr::Header {
-            name: "X-Auth".to_string(),
+            name: "x-auth".to_string(),
+            header_name: HeaderName::from_static("x-auth"),
             value: None,
         };
         let headers = expr.collect_existence_headers();
-        assert_eq!(headers, vec!["X-Auth".to_string()]);
+        assert_eq!(headers, vec!["x-auth".to_string()]);
     }
 
     #[test]
     fn test_collect_existence_headers_with_value_ignored() {
         // Header with value match should NOT be collected
         let expr = Expr::Header {
-            name: "X-Auth".to_string(),
+            name: "x-auth".to_string(),
+            header_name: HeaderName::from_static("x-auth"),
             value: Some(HeaderMatch::Exact("secret".to_string())),
         };
         let headers = expr.collect_existence_headers();
@@ -453,18 +493,20 @@ mod tests {
         // AND with two existence checks
         let expr = Expr::And(
             Box::new(Expr::Header {
-                name: "X-Auth".to_string(),
+                name: "x-auth".to_string(),
+                header_name: HeaderName::from_static("x-auth"),
                 value: None,
             }),
             Box::new(Expr::Header {
-                name: "X-Customer-Id".to_string(),
+                name: "x-customer-id".to_string(),
+                header_name: HeaderName::from_static("x-customer-id"),
                 value: None,
             }),
         );
         let headers = expr.collect_existence_headers();
         assert_eq!(headers.len(), 2);
-        assert!(headers.contains(&"X-Auth".to_string()));
-        assert!(headers.contains(&"X-Customer-Id".to_string()));
+        assert!(headers.contains(&"x-auth".to_string()));
+        assert!(headers.contains(&"x-customer-id".to_string()));
     }
 
     #[test]
@@ -472,16 +514,18 @@ mod tests {
         // Mix of existence check and value match - only existence collected
         let expr = Expr::And(
             Box::new(Expr::Header {
-                name: "X-Auth".to_string(),
+                name: "x-auth".to_string(),
+                header_name: HeaderName::from_static("x-auth"),
                 value: Some(HeaderMatch::Exact("token".to_string())),
             }),
             Box::new(Expr::Header {
-                name: "X-Request-Id".to_string(),
+                name: "x-request-id".to_string(),
+                header_name: HeaderName::from_static("x-request-id"),
                 value: None,
             }),
         );
         let headers = expr.collect_existence_headers();
-        assert_eq!(headers, vec!["X-Request-Id".to_string()]);
+        assert_eq!(headers, vec!["x-request-id".to_string()]);
     }
 
     #[test]
@@ -491,19 +535,21 @@ mod tests {
             Box::new(Expr::And(
                 Box::new(Expr::Host(make_glob("*.com"))),
                 Box::new(Expr::Header {
-                    name: "X-First".to_string(),
+                    name: "x-first".to_string(),
+                    header_name: HeaderName::from_static("x-first"),
                     value: None,
                 }),
             )),
             Box::new(Expr::Not(Box::new(Expr::Header {
-                name: "X-Second".to_string(),
+                name: "x-second".to_string(),
+                header_name: HeaderName::from_static("x-second"),
                 value: None,
             }))),
         );
         let headers = expr.collect_existence_headers();
         assert_eq!(headers.len(), 2);
-        assert!(headers.contains(&"X-First".to_string()));
-        assert!(headers.contains(&"X-Second".to_string()));
+        assert!(headers.contains(&"x-first".to_string()));
+        assert!(headers.contains(&"x-second".to_string()));
     }
 
     #[test]
@@ -587,10 +633,11 @@ mod tests {
     #[test]
     fn test_condition_signature_not() {
         let expr = Expr::Not(Box::new(Expr::Header {
-            name: "X-Auth".to_string(),
+            name: "x-auth".to_string(),
+            header_name: HeaderName::from_static("x-auth"),
             value: None,
         }));
-        assert_eq!(expr.condition_signature(), r#"!header("X-Auth")"#);
+        assert_eq!(expr.condition_signature(), r#"!header("x-auth")"#);
     }
 
     #[test]

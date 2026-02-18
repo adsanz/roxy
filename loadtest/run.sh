@@ -76,8 +76,8 @@ class H(http.server.BaseHTTPRequestHandler):
     do_HEAD = do_GET
     def log_message(self, *a): pass   # silence logs
 
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(('0.0.0.0', ${TARGET_PORT}), H) as s:
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+with socketserver.ThreadingTCPServer(('0.0.0.0', ${TARGET_PORT}), H) as s:
     s.serve_forever()
 " &
     ECHO_PID=$!

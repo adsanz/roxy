@@ -2,6 +2,12 @@
 //!
 //! Built on Hudsucker with a custom rule DSL.
 
+// Use jemalloc on non-MSVC targets to avoid glibc malloc fragmentation.
+// glibc retains high-water RSS indefinitely; jemalloc actively defragments.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use hudsucker::{
     rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose},
     rustls::crypto::aws_lc_rs,
