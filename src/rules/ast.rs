@@ -25,7 +25,9 @@ pub struct CompiledRule {
     /// Extracted method for indexing (if rule has simple method check)
     pub indexed_method: Option<Method>,
 
-    /// Pre-computed header names for existence-only checks (logging).
+    /// Pre-computed header names referenced in the rule expression (for logging).
+    /// Includes both existence checks (`header("X-Auth")`) and value-match
+    /// checks (`header("X-Type", "internal")`).
     /// Stores (HeaderName, String) pairs: HeaderName for zero-alloc lookup,
     /// String for the key in the logged headers HashMap.
     /// Computed once at rule compile time to avoid per-request AST traversal.

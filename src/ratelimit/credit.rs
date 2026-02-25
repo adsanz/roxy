@@ -31,7 +31,13 @@ pub enum CreditResult {
     Exhausted {
         retry_after_secs: u64,
         reset_time: String,
+        limit: u64,
+        reset_after_secs: u64,
     },
+    /// Rule not registered in credit manager (missing `config.credits` entry).
+    /// The handler should log this at error level and let the request through
+    /// rather than silently allowing unlimited traffic.
+    NotConfigured,
 }
 
 /// Reset schedule for credit buckets.
@@ -229,11 +235,7 @@ impl CreditManager {
         let config_ref = match self.configs.get(rule_name) {
             Some(c) => c,
             None => {
-                return CreditResult::Allowed {
-                    remaining: u64::MAX,
-                    limit: u64::MAX,
-                    reset_after_secs: 0,
-                };
+                return CreditResult::NotConfigured;
             }
         };
 
@@ -308,9 +310,12 @@ impl CreditManager {
         let reset_at = bucket.reset_at.load(Ordering::Relaxed);
 
         if used >= config.budget {
+            let reset_secs = reset_at.saturating_sub(now_epoch);
             return CreditResult::Exhausted {
-                retry_after_secs: reset_at.saturating_sub(now_epoch),
+                retry_after_secs: reset_secs,
                 reset_time: ResetSchedule::format_reset_time(reset_at),
+                limit: config.budget,
+                reset_after_secs: reset_secs,
             };
         }
 

@@ -242,6 +242,25 @@ RUST_LOG=debug ./target/release/roxy --config config.yaml
 RUST_LOG=roxy::rules=debug,roxy::proxy=info ./target/release/roxy --config config.yaml
 ```
 
+## Live Stats
+
+A bundled bash script parses roxy's JSON log output in real time and displays a refreshing dashboard with traffic statistics.
+
+```bash
+docker logs -f <container> 2>&1 | ./scripts/live-stats.sh
+```
+
+Tracks:
+- **Paths** — Top 20 paths by hit count
+- **Rules** — Requests per matched rule
+- **Rate limited** — Requests rejected with 429 (rate limit)
+- **Credit exhausted** — Requests rejected with 429 (credit budget)
+- **Errors** — Grouped by level and message type
+
+![Live Stats](docs/live-stats.png)
+
+> Requires `jq`. Install with `apt install jq` or `brew install jq`.
+
 ## Documentation
 
 | Topic | Link |

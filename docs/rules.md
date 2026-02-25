@@ -144,7 +144,7 @@ When a rule matches, Roxy automatically logs the actual values of **all headers 
 
 - `header("X-Customer-Id")` — existence check → **value is logged**
 - `header("X-Name:value")` — value match → **value is logged**
-- Multiple headers in a rule → all referenced headers are logged
+- Multiple headers in a rule → all referenced headers are logged (up to 8 per rule; extras are silently omitted)
 
 ```json
 {"method":"GET","host":"api.example.com","path":"/api/users","rule":"track-customer","action":"forward","headers":{"X-Customer-Id":"cust-12345","X-Version":"v2"}}

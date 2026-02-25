@@ -11,7 +11,7 @@ use hudsucker::{
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::config::{HeaderMangleConfig, ThrottleConfig};
 use crate::ratelimit::{CreditManager, CreditResult, RateLimitResult, RateLimiter};
@@ -532,6 +532,8 @@ impl HttpHandler for RoxyHandler {
                         CreditResult::Exhausted {
                             retry_after_secs,
                             reset_time,
+                            limit,
+                            reset_after_secs,
                         } => {
                             let message = self
                                 .credit_manager
@@ -547,14 +549,31 @@ impl HttpHandler for RoxyHandler {
                                 reset_time = %reset_time,
                                 headers = ?logged_headers
                             );
+                            let exhausted_headers = CreditHeaders {
+                                limit,
+                                remaining: 0,
+                                reset_after_secs,
+                            };
                             return Self::build_response(
                                 StatusCode::TOO_MANY_REQUESTS,
                                 &message,
                                 Some(retry_after_secs),
                                 None,
-                                None,
+                                Some(&exhausted_headers),
                             )
                             .into();
+                        }
+                        CreditResult::NotConfigured => {
+                            error!(
+                                target: "proxy",
+                                rule = %rule_name,
+                                "Credit rule not configured in credit manager — check config.credits"
+                            );
+                            if *mangle {
+                                mangle_rules.push_name(rule_name);
+                            }
+                            matched_rule = rule_name;
+                            matched_headers = logged_headers;
                         }
                     }
                 }
@@ -652,6 +671,8 @@ impl HttpHandler for RoxyHandler {
                                 CreditResult::Exhausted {
                                     retry_after_secs,
                                     reset_time,
+                                    limit: credit_limit,
+                                    reset_after_secs: credit_reset,
                                 } => {
                                     let message = self
                                         .credit_manager
@@ -667,12 +688,17 @@ impl HttpHandler for RoxyHandler {
                                         reset_time = %reset_time,
                                         headers = ?logged_headers
                                     );
+                                    let exhausted_headers = CreditHeaders {
+                                        limit: credit_limit,
+                                        remaining: 0,
+                                        reset_after_secs: credit_reset,
+                                    };
                                     return Self::build_response(
                                         StatusCode::TOO_MANY_REQUESTS,
                                         &message,
                                         Some(retry_after_secs),
                                         self.pending_ratelimit_headers.as_ref(),
-                                        None,
+                                        Some(&exhausted_headers),
                                     )
                                     .into();
                                 }
@@ -722,6 +748,18 @@ impl HttpHandler for RoxyHandler {
                                         ))
                                         .await;
                                     }
+                                    if *mangle {
+                                        mangle_rules.push_name(rule_name);
+                                    }
+                                    matched_rule = rule_name;
+                                    matched_headers = logged_headers;
+                                }
+                                CreditResult::NotConfigured => {
+                                    error!(
+                                        target: "proxy",
+                                        rule = %rule_name,
+                                        "Credit rule not configured in credit manager — check config.credits"
+                                    );
                                     if *mangle {
                                         mangle_rules.push_name(rule_name);
                                     }

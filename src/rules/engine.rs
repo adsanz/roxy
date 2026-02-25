@@ -40,7 +40,8 @@ pub struct RuleMatch<'idx, 'req> {
 ///
 /// Stores up to `MAX_LOGGED_HEADERS` pairs on the stack. Borrows both
 /// keys (from CompiledRule) and values (from request HeaderMap).
-const MAX_LOGGED_HEADERS: usize = 4;
+/// Rules referencing more headers than this cap will have truncated logging.
+const MAX_LOGGED_HEADERS: usize = 8;
 
 pub struct LoggedHeaders<'a> {
     entries: [Option<(&'a str, &'a str)>; MAX_LOGGED_HEADERS],

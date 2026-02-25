@@ -312,6 +312,20 @@ async fn main() {
         );
     }
 
+    // Validate: every DSL credit() rule must have a matching config.credits entry
+    let configured_credit_rules: std::collections::HashSet<&str> =
+        config.credits.iter().map(|c| c.rule.as_str()).collect();
+    for rule_name in credit_budgets.keys() {
+        if !configured_credit_rules.contains(rule_name.as_str()) {
+            error!(
+                target: "proxy",
+                rule = %rule_name,
+                "DSL rule has credit() action but no matching entry in config.credits"
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Spawn background cleanup task for credit manager
     let cleanup_credits = Arc::clone(&credit_manager);
     let shutdown_cr = Arc::clone(&shutdown);
@@ -354,7 +368,8 @@ async fn main() {
             credit_manager,
             config.reload_interval_secs,
             Arc::clone(&shutdown),
-        );
+        )
+        .await;
     } else {
         info!(target: "proxy", "Config hot reload disabled (reload_interval_secs = 0)");
     }

@@ -41,15 +41,15 @@ use crate::rules::RuleIndex;
 /// * `credit_manager` - The credit manager to re-register credit rules on reload
 /// * `interval_secs` - How often to check for changes (seconds)
 /// * `shutdown` - Notify handle for graceful shutdown
-pub fn spawn_config_watcher(
+pub async fn spawn_config_watcher(
     config_path: PathBuf,
     shared_config: Arc<ArcSwap<SharedConfig>>,
     credit_manager: Arc<CreditManager>,
     interval_secs: u64,
     shutdown: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
-    // Read initial config bytes for baseline comparison
-    let initial_bytes = std::fs::read(&config_path).unwrap_or_default();
+    // Read initial config bytes before spawning to avoid racing with caller writes
+    let initial_bytes = tokio::fs::read(&config_path).await.unwrap_or_default();
 
     tokio::spawn(async move {
         let mut last_bytes = initial_bytes;
@@ -208,6 +208,25 @@ pub fn spawn_config_watcher(
                 );
             }
 
+            // Reverse validation: every DSL credit() rule must have a config.credits entry
+            let configured_credit_rules: std::collections::HashSet<&str> =
+                new_config.credits.iter().map(|c| c.rule.as_str()).collect();
+            let mut orphan_credit = false;
+            for rule_name in credit_budgets.keys() {
+                if !configured_credit_rules.contains(rule_name.as_str()) {
+                    warn!(
+                        target: "reload",
+                        rule = %rule_name,
+                        "DSL rule has credit() action but no matching entry in config.credits, rejecting reload"
+                    );
+                    orphan_credit = true;
+                }
+            }
+            if orphan_credit {
+                warn!(target: "reload", "Config reload rejected: orphan credit rules detected");
+                continue;
+            }
+
             // Build new shared config and atomically swap
             let new_shared = SharedConfig::new(new_rules, new_config.headers, new_config.throttle);
             shared_config.store(Arc::new(new_shared));
@@ -256,7 +275,8 @@ mod tests {
             Arc::clone(&credit_manager),
             1,
             Arc::clone(&shutdown),
-        );
+        )
+        .await;
 
         // Verify initial state
         assert_eq!(arc.load().rules.rule_count(), 1);
@@ -296,7 +316,8 @@ mod tests {
             Arc::clone(&credit_manager),
             1,
             Arc::clone(&shutdown),
-        );
+        )
+        .await;
 
         // Write invalid config
         std::fs::write(&config_path, yaml_invalid).unwrap();
@@ -390,7 +411,8 @@ credits:
             Arc::clone(&credit_manager),
             1,
             Arc::clone(&shutdown),
-        );
+        )
+        .await;
 
         // Write updated config with budget 200
         std::fs::write(&config_path, yaml2).unwrap();
