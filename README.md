@@ -16,6 +16,7 @@ Roxy combines ACL filtering, header mangling, rate limiting, and TLS inspection 
 - **Rate Limiting** — Sliding window rate limiter with soft/hard limits and progressive throttling ([docs](docs/rate-limiting.md))
 - **Credit System** — Fixed-budget rate limiting with scheduled resets ([docs](docs/rate-limiting.md))
 - **Header Mangling** — Add/remove headers based on rule matches
+- **Header Logging** — Headers referenced in rules are automatically logged with their values (up to 8 per rule, zero-allocation, configurable via `MAX_LOGGED_HEADERS`)
 - **Hot Reload** — Automatic config reload without restart, preserving rate limit and credit state
 - **Method-Indexed Rules** — O(1) rule lookup by HTTP method
 - **Memory-Conscious** — jemalloc allocator, configurable caches and pools ([docs](docs/memory-tuning.md))
