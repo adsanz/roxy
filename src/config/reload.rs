@@ -68,7 +68,7 @@ pub fn spawn_config_watcher(
             }
 
             // Read config file — if it fails, log and skip this cycle
-            let new_bytes = match std::fs::read(&config_path) {
+            let new_bytes = match tokio::fs::read(&config_path).await {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(

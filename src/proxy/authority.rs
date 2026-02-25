@@ -204,21 +204,29 @@ impl CertificateAuthority for RoxyAuthority {
             "Building TLS config with certificate chain"
         );
 
-        let mut server_cfg = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
+        // Build ServerConfig — fall back on any error instead of panicking
+        let builder = match ServerConfig::builder_with_provider(Arc::clone(&self.provider))
             .with_safe_default_protocol_versions()
-            .unwrap_or_else(|e| {
-                warn!(target: "proxy", error = %e, "Protocol version error — using fallback");
-                // This should never fail with safe defaults, but don't crash if it does.
-                unreachable!("with_safe_default_protocol_versions should never fail")
-            })
+        {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(target: "proxy", error = %e,
+                      "Protocol version error — returning fallback");
+                return self.fallback_server_config();
+            }
+        };
+
+        let mut server_cfg = match builder
             .with_no_client_auth()
             .with_single_cert(certs, self.private_key.clone_key())
-            .unwrap_or_else(|e| {
-                warn!(target: "proxy", authority = %authority, error = %e, "Failed to build ServerConfig");
-                // Return a minimal config that will reject connections
-                // This should be unreachable since we just generated valid certs
-                unreachable!("with_single_cert should not fail with freshly generated certs")
-            });
+        {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                warn!(target: "proxy", authority = %authority, error = %e,
+                      "Failed to build ServerConfig — returning fallback");
+                return self.fallback_server_config();
+            }
+        };
 
         server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 

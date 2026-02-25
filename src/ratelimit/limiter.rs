@@ -147,6 +147,9 @@ impl RateLimiter {
         // redundantly run cleanup right after the background task.
         self.last_cleanup.store(now_ms, Ordering::Relaxed);
         self.cleanup(now_ms);
+        // Reclaim hash table capacity only from the background task
+        // to avoid shard-lock contention on the request path.
+        self.windows.shrink_to_fit();
     }
 
     /// Remove entries that haven't been accessed in 2 windows.
@@ -156,9 +159,6 @@ impl RateLimiter {
             // Keep if accessed within last 2 windows
             now_ms.saturating_sub(last_access) < window.window_ms * 2
         });
-        // Release hash table capacity freed by retain().
-        // Without this, DashMap retains its high-water capacity forever.
-        self.windows.shrink_to_fit();
     }
 }
 

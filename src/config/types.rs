@@ -286,7 +286,7 @@ impl ProxyConfig {
             }
             if throttle.max_delay_ms > MAX_THROTTLE_DELAY_MS {
                 return Err(ConfigError::Invalid(format!(
-                    "Throttle '{}': max_delay_ms ({}) exceeds maximum allowed value ({}ms) you can rebuilt with MAX_THROTTLE_DELAY_MS set higher if you need longer delays",
+                    "Throttle '{}': max_delay_ms ({}) exceeds maximum allowed value ({}ms) you can rebuild with MAX_THROTTLE_DELAY_MS set higher if you need longer delays",
                     throttle.rule, throttle.max_delay_ms, MAX_THROTTLE_DELAY_MS
                 )));
             }

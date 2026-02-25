@@ -253,7 +253,7 @@ impl CreditManager {
         let total_len = rule_name.len() + 1 + key.len();
         let mut stack_key = StackString::<128>::new();
         let fits_stack = stack_key.push_str(rule_name).is_ok()
-            && stack_key.push(':').is_ok()
+            && stack_key.push_ascii(':').is_ok()
             && stack_key.push_str(key).is_ok();
 
         if fits_stack && let Some(mut entry) = self.buckets.get_mut(stack_key.as_str()) {
@@ -379,6 +379,9 @@ impl CreditManager {
             // Past reset: safe to remove if not accessed recently
             now_epoch.saturating_sub(bucket.last_access.load(Ordering::Relaxed)) < expiry_secs
         });
+        // Reclaim hash table capacity after cleanup.
+        // force_cleanup is only called from the background task,
+        // so shard-lock contention with the request path is minimal.
         self.buckets.shrink_to_fit();
     }
 }

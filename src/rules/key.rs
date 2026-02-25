@@ -50,7 +50,7 @@ pub fn extract_ip_key(rule_name: &str, ctx: &EvalContext) -> IpKey {
     let mut key = StackString::<IP_KEY_CAP>::new();
     let ok = key.push_str("__ip_baseline__:").is_ok()
         && key.push_str(rule_name).is_ok()
-        && key.push(':').is_ok()
+        && key.push_ascii(':').is_ok()
         && match ctx.client_ip {
             Some(ip) => write!(key, "{}", ip).is_ok(),
             None => key.push_str(MISSING_PLACEHOLDER).is_ok(),

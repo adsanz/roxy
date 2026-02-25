@@ -5,8 +5,8 @@ use std::fmt::{self, Write};
 /// A fixed-capacity string buffer allocated entirely on the stack.
 ///
 /// Used for formatting DashMap lookup keys (ip-baseline, credit bucket)
-/// without heap allocation on the fast path. Falls back to [`String`]
-/// via [`StackString::to_cow`] only if the formatted key exceeds `N` bytes.
+/// without heap allocation on the fast path. When the formatted key exceeds
+/// `N` bytes, writes return `fmt::Error` and callers fall back to [`String`].
 ///
 /// `N` should be chosen to cover the common case. For rate-limit keys
 /// like `__ip_baseline__:rule-name:255.255.255.255`, 128 bytes is generous.
@@ -48,14 +48,14 @@ impl<const N: usize> StackString<N> {
         Ok(())
     }
 
-    /// Push a single ASCII byte.
+    /// Push a single ASCII character.
+    ///
+    /// Returns `fmt::Error` if the buffer is full or if `c` is not ASCII.
     #[inline]
-    pub fn push(&mut self, c: char) -> Result<(), fmt::Error> {
-        if self.len >= N {
+    pub fn push_ascii(&mut self, c: char) -> Result<(), fmt::Error> {
+        if !c.is_ascii() || self.len >= N {
             return Err(fmt::Error);
         }
-        // Only safe for single-byte chars; callers use ':' exclusively.
-        debug_assert!(c.is_ascii());
         self.buf[self.len] = c as u8;
         self.len += 1;
         Ok(())
@@ -79,7 +79,7 @@ mod tests {
     fn test_stack_string_basic() {
         let mut s = StackString::<64>::new();
         s.push_str("hello").unwrap();
-        s.push(':').unwrap();
+        s.push_ascii(':').unwrap();
         s.push_str("world").unwrap();
         assert_eq!(s.as_str(), "hello:world");
     }
@@ -103,7 +103,7 @@ mod tests {
     fn test_stack_string_exact_fit() {
         let mut s = StackString::<11>::new();
         s.push_str("hello").unwrap();
-        s.push(':').unwrap();
+        s.push_ascii(':').unwrap();
         s.push_str("world").unwrap();
         assert_eq!(s.as_str(), "hello:world");
         assert_eq!(s.as_str().len(), 11);
@@ -112,12 +112,19 @@ mod tests {
     #[test]
     fn test_stack_string_push_char_overflow() {
         let mut s = StackString::<3>::new();
-        assert!(s.push('a').is_ok());
-        assert!(s.push('b').is_ok());
-        assert!(s.push('c').is_ok());
+        assert!(s.push_ascii('a').is_ok());
+        assert!(s.push_ascii('b').is_ok());
+        assert!(s.push_ascii('c').is_ok());
         // Buffer is full, next push should fail
-        assert!(s.push('d').is_err());
+        assert!(s.push_ascii('d').is_err());
         assert_eq!(s.as_str(), "abc");
+    }
+
+    #[test]
+    fn test_stack_string_push_non_ascii_rejected() {
+        let mut s = StackString::<64>::new();
+        assert!(s.push_ascii('\u{00e9}').is_err()); // é is non-ASCII
+        assert_eq!(s.as_str(), ""); // nothing written
     }
 
     #[test]
