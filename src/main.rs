@@ -22,8 +22,9 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use arc_swap::ArcSwap;
 use roxy::config::ProxyConfig;
-use roxy::proxy::{RoxyAuthority, RoxyHandler};
+use roxy::proxy::{RoxyAuthority, RoxyHandler, SharedConfig};
 use roxy::ratelimit::{CreditManager, CreditRuleConfig, RateLimiter, ResetSchedule};
 use roxy::rules::RuleIndex;
 
@@ -202,7 +203,7 @@ async fn main() {
 
     // Build rule index
     let rules = match RuleIndex::from_config(&config.rules) {
-        Ok(r) => Arc::new(r),
+        Ok(r) => r,
         Err(errors) => {
             for e in &errors {
                 error!(target: "proxy", error = %e, "Rule parse error");
@@ -325,14 +326,38 @@ async fn main() {
         }
     });
 
-    // Create handler
-    let handler = RoxyHandler::new(
+    // Build hot-reloadable shared config (rules + headers + throttle)
+    let shared_config = SharedConfig::new(
         rules,
-        rate_limiter,
-        credit_manager,
         config.headers.clone(),
         config.throttle.clone(),
     );
+    let shared_config = Arc::new(ArcSwap::from_pointee(shared_config));
+
+    // Create handler
+    let handler = RoxyHandler::new(
+        Arc::clone(&shared_config),
+        rate_limiter,
+        Arc::clone(&credit_manager),
+    );
+
+    // Spawn config reload watcher (if enabled)
+    if config.reload_interval_secs > 0 {
+        info!(
+            target: "proxy",
+            interval_secs = config.reload_interval_secs,
+            "Config hot reload enabled"
+        );
+        roxy::config::reload::spawn_config_watcher(
+            args.config_path.clone(),
+            shared_config,
+            credit_manager,
+            config.reload_interval_secs,
+            Arc::clone(&shutdown),
+        );
+    } else {
+        info!(target: "proxy", "Config hot reload disabled (reload_interval_secs = 0)");
+    }
 
     // Create Certificate Authority for MITM
     let ca = create_ca(&config);

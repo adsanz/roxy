@@ -360,7 +360,8 @@ impl RuleIndex {
         None
     }
 
-    /// Collect header values for headers that are existence-only checks in the rule.
+    /// Collect header values for all headers referenced in the rule.
+    /// Includes both existence-only and value-match headers (for logging).
     /// Uses pre-computed (HeaderName, String) pairs from `CompiledRule` for
     /// zero-alloc HeaderMap lookups. Returns stack-allocated LoggedHeaders.
     fn collect_logged_headers<'req>(
@@ -752,10 +753,10 @@ mod tests {
     }
 
     #[test]
-    fn test_logged_headers_empty_when_no_existence_checks() {
+    fn test_logged_headers_includes_value_match() {
         let mut index = RuleIndex::new();
 
-        // Rule with value match (not existence-only)
+        // Rule with value match — now also logged
         let rule = parse_rule("value-match", r#"header("X-Auth:secret") = pass"#).unwrap();
         index.add_rule(rule);
         index.rebuild_merged_index();
@@ -769,9 +770,10 @@ mod tests {
 
         let r = index.evaluate(&ctx).unwrap();
         assert!(matches!(r.action, Action::Pass));
-        assert!(
-            r.logged_headers.is_empty(),
-            "Value matches should not be logged"
+        assert_eq!(
+            r.logged_headers.get("x-auth"),
+            Some("secret"),
+            "Value-match headers should now be logged"
         );
     }
 

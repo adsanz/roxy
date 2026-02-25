@@ -190,7 +190,7 @@ impl CompiledRule {
         // Pre-compute (HeaderName, String) pairs for logging.
         // HeaderName enables zero-alloc HeaderMap lookups, String is the logged key.
         let logged_header_names: Vec<(HeaderName, String)> = condition
-            .collect_existence_headers()
+            .collect_referenced_headers()
             .into_iter()
             .filter_map(|h| {
                 let lower = h.to_lowercase();
@@ -230,30 +230,28 @@ impl CompiledRule {
 }
 
 impl Expr {
-    /// Collect header names that are existence-only checks (value is None).
-    /// Recursively traverses the expression tree.
-    pub fn collect_existence_headers(&self) -> Vec<String> {
+    /// Collect all header names referenced in the expression tree.
+    /// Includes both existence-only checks and value-match checks.
+    /// Used for logging header values at match time.
+    pub fn collect_referenced_headers(&self) -> Vec<String> {
         let mut headers = Vec::new();
-        self.collect_existence_headers_recursive(&mut headers);
+        self.collect_referenced_headers_recursive(&mut headers);
         headers
     }
 
-    fn collect_existence_headers_recursive(&self, headers: &mut Vec<String>) {
+    fn collect_referenced_headers_recursive(&self, headers: &mut Vec<String>) {
         match self {
-            Expr::Header {
-                name, value: None, ..
-            } => {
-                // Only collect headers that are existence checks (no value matcher)
+            Expr::Header { name, .. } => {
                 headers.push(name.clone());
             }
             Expr::Not(inner) => {
-                inner.collect_existence_headers_recursive(headers);
+                inner.collect_referenced_headers_recursive(headers);
             }
             Expr::And(left, right) | Expr::Or(left, right) => {
-                left.collect_existence_headers_recursive(headers);
-                right.collect_existence_headers_recursive(headers);
+                left.collect_referenced_headers_recursive(headers);
+                right.collect_referenced_headers_recursive(headers);
             }
-            // Host, Path, Method, Header with value don't contribute
+            // Host, Path, Method don't contribute headers
             _ => {}
         }
     }
@@ -465,31 +463,31 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_existence_headers_simple() {
+    fn test_collect_referenced_headers_simple() {
         // Single existence check
         let expr = Expr::Header {
             name: "x-auth".to_string(),
             header_name: HeaderName::from_static("x-auth"),
             value: None,
         };
-        let headers = expr.collect_existence_headers();
+        let headers = expr.collect_referenced_headers();
         assert_eq!(headers, vec!["x-auth".to_string()]);
     }
 
     #[test]
-    fn test_collect_existence_headers_with_value_ignored() {
-        // Header with value match should NOT be collected
+    fn test_collect_referenced_headers_value_match_included() {
+        // Header with value match IS now collected (for logging)
         let expr = Expr::Header {
             name: "x-auth".to_string(),
             header_name: HeaderName::from_static("x-auth"),
             value: Some(HeaderMatch::Exact("secret".to_string())),
         };
-        let headers = expr.collect_existence_headers();
-        assert!(headers.is_empty());
+        let headers = expr.collect_referenced_headers();
+        assert_eq!(headers, vec!["x-auth".to_string()]);
     }
 
     #[test]
-    fn test_collect_existence_headers_and_expr() {
+    fn test_collect_referenced_headers_and_expr() {
         // AND with two existence checks
         let expr = Expr::And(
             Box::new(Expr::Header {
@@ -503,15 +501,15 @@ mod tests {
                 value: None,
             }),
         );
-        let headers = expr.collect_existence_headers();
+        let headers = expr.collect_referenced_headers();
         assert_eq!(headers.len(), 2);
         assert!(headers.contains(&"x-auth".to_string()));
         assert!(headers.contains(&"x-customer-id".to_string()));
     }
 
     #[test]
-    fn test_collect_existence_headers_mixed() {
-        // Mix of existence check and value match - only existence collected
+    fn test_collect_referenced_headers_mixed() {
+        // Mix of existence check and value match — both collected now
         let expr = Expr::And(
             Box::new(Expr::Header {
                 name: "x-auth".to_string(),
@@ -524,12 +522,14 @@ mod tests {
                 value: None,
             }),
         );
-        let headers = expr.collect_existence_headers();
-        assert_eq!(headers, vec!["x-request-id".to_string()]);
+        let headers = expr.collect_referenced_headers();
+        assert_eq!(headers.len(), 2);
+        assert!(headers.contains(&"x-auth".to_string()));
+        assert!(headers.contains(&"x-request-id".to_string()));
     }
 
     #[test]
-    fn test_collect_existence_headers_nested() {
+    fn test_collect_referenced_headers_nested() {
         // Nested: (host && header) || !header
         let expr = Expr::Or(
             Box::new(Expr::And(
@@ -546,20 +546,20 @@ mod tests {
                 value: None,
             }))),
         );
-        let headers = expr.collect_existence_headers();
+        let headers = expr.collect_referenced_headers();
         assert_eq!(headers.len(), 2);
         assert!(headers.contains(&"x-first".to_string()));
         assert!(headers.contains(&"x-second".to_string()));
     }
 
     #[test]
-    fn test_collect_existence_headers_no_headers() {
+    fn test_collect_referenced_headers_no_headers() {
         // Expression with no header checks
         let expr = Expr::And(
             Box::new(Expr::Host(make_glob("*.com"))),
             Box::new(Expr::Path(make_glob("/api/*"))),
         );
-        let headers = expr.collect_existence_headers();
+        let headers = expr.collect_referenced_headers();
         assert!(headers.is_empty());
     }
 

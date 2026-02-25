@@ -3,6 +3,9 @@
 
 listen: "0.0.0.0:8080"
 
+# Hot reload: check for config file changes every N seconds (0 = disabled, default: 5)
+reload_interval_secs: 5
+
 # TLS/MITM configuration (optional)
 # tls:
 #   ca_cert: "./ca.crt"

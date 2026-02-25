@@ -46,6 +46,17 @@ pub struct ProxyConfig {
     /// Credit system settings
     #[serde(default)]
     pub credits: Vec<CreditConfig>,
+
+    /// Hot reload check interval in seconds (default: 5, 0 = disabled).
+    /// When enabled, the proxy periodically checks for config file changes
+    /// and reloads rules, headers, and throttle config without restarting.
+    /// Credit and rate limit state is preserved across reloads.
+    #[serde(default = "default_reload_interval_secs")]
+    pub reload_interval_secs: u64,
+}
+
+fn default_reload_interval_secs() -> u64 {
+    5
 }
 
 /// Connection pool configuration.

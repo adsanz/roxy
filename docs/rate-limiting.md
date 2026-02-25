@@ -119,3 +119,35 @@ rate_limit:
 - Credit buckets are removed only after their credit window has ended **and** 48 hours of inactivity. A weekly bucket is never removed mid-window, even if the user is silent for days.
 - If a cleaned-up user makes a new request, a fresh bucket is created with `used: 0` — the same state as a reset.
 - Both maps call `shrink_to_fit()` after cleanup to release hash table capacity.
+
+## Response Headers
+
+Roxy injects standard rate limit headers into forwarded responses so clients can track their quota usage. Rate limit and credit headers are separate to avoid collisions when both systems apply to the same request.
+
+### Rate Limit Headers (`X-RateLimit-*`)
+
+Injected when a `rate_limit()` rule matches:
+
+| Header | Description |
+|--------|-------------|
+| `X-RateLimit-Limit` | Maximum requests allowed in the window |
+| `X-RateLimit-Remaining` | Remaining requests in the current window |
+| `X-RateLimit-Reset` | Seconds until the window resets |
+
+### Credit Headers (`X-Credit-*`)
+
+Injected when a `credit()` rule matches:
+
+| Header | Description |
+|--------|-------------|
+| `X-Credit-Limit` | Total credit budget for the period |
+| `X-Credit-Remaining` | Remaining credits in the current period |
+| `X-Credit-Reset` | Seconds until credits reset |
+
+### Composite Rules
+
+When using `rate_limit(...) + credit(...)`, **both** header sets are injected into the response. Clients can distinguish between burst rate limiting and budget quota by checking the appropriate header prefix.
+
+### Rejection Responses (429)
+
+When a request is rejected (hard limit exceeded), the relevant headers are included in the 429 response body along with a `Retry-After` header. For composite rules where credit is exhausted, both `X-RateLimit-*` and `X-Credit-*` headers are included.

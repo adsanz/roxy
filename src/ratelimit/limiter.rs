@@ -81,6 +81,9 @@ impl RateLimiter {
     /// Uses a two-phase lookup to avoid allocating a `String` for existing entries:
     /// 1. `get_mut(&str)` — zero-alloc fast-path for keys already in the map
     /// 2. `entry(key.to_string())` — allocates only on first sight of a new key
+    ///
+    /// On the fast path, `max_requests` is always applied to existing windows so
+    /// that config hot-reloads take effect immediately without resetting counters.
     pub fn check(&self, key: &str, max_requests: u64, window_secs: u64) -> RateLimitResult {
         let now = Instant::now();
         let now_ms = now.duration_since(self.start_time).as_millis() as u64;
@@ -91,7 +94,10 @@ impl RateLimiter {
         // because parking_lot::RwLock is not reentrant.
         let result = {
             // Fast path: key already exists — zero alloc, just get_mut with &str
-            if let Some(window) = self.windows.get_mut(key) {
+            if let Some(mut window) = self.windows.get_mut(key) {
+                // Apply current config limit so hot-reload changes are
+                // reflected immediately without resetting sliding window state.
+                window.max_requests = max_requests;
                 window.check_and_increment(now_ms)
             } else {
                 // Slow path: first time seeing this key — allocate String for entry()
@@ -420,5 +426,74 @@ mod tests {
         // After single-window rotation, previous should have old count
         let r = limiter.check("rot-key", 100, 1);
         assert!(matches!(r, RateLimitResult::Allowed { .. }));
+    }
+
+    // === Delta-aware: max_requests changes take effect immediately ===
+
+    #[test]
+    fn test_rate_limit_increase_preserves_counters() {
+        let limiter = RateLimiter::new(Duration::from_secs(60));
+
+        // Use 8 out of 10 requests
+        for i in 0..8 {
+            let r = limiter.check("delta-key", 10, 1);
+            assert!(
+                matches!(r, RateLimitResult::Allowed { .. }),
+                "Request {} should be allowed under limit 10",
+                i
+            );
+        }
+
+        // Verify 2 remaining under old limit
+        let r = limiter.check("delta-key", 10, 1);
+        assert!(
+            matches!(
+                r,
+                RateLimitResult::Allowed {
+                    remaining: 1,
+                    limit: 10,
+                    ..
+                }
+            ),
+            "Expected 1 remaining with limit 10, got {:?}",
+            r
+        );
+
+        // "Hot reload": increase limit from 10 → 20
+        // The next check should use the new limit, preserving counters.
+        // 9 used before this call (weighted_count=9), limit=20
+        // remaining = floor(20 - 9 - 1) = 10
+        let r = limiter.check("delta-key", 20, 1);
+        assert!(
+            matches!(
+                r,
+                RateLimitResult::Allowed {
+                    remaining: 10,
+                    limit: 20,
+                    ..
+                }
+            ),
+            "After increase to 20, expected 10 remaining, got {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_decrease_applies_immediately() {
+        let limiter = RateLimiter::new(Duration::from_secs(60));
+
+        // Use 8 out of 10 requests
+        for _ in 0..8 {
+            limiter.check("dec-key", 10, 1);
+        }
+
+        // "Hot reload": decrease limit from 10 → 5
+        // 8 used, limit 5 => should be limited immediately
+        let r = limiter.check("dec-key", 5, 1);
+        assert!(
+            matches!(r, RateLimitResult::Limited { limit: 5, .. }),
+            "After decrease to 5, should be limited, got {:?}",
+            r
+        );
     }
 }

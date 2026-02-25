@@ -138,14 +138,14 @@ headers:
       - "X-Customer-Id"
 ```
 
-## Smart Header Logging
+## Header Logging
 
-When a rule uses **existence-only header checks** (e.g., `header("X-Customer-Id")` without a value), Roxy automatically logs the actual header value when the rule matches.
+When a rule matches, Roxy automatically logs the actual values of **all headers referenced in the rule expression** — both existence checks and value-match checks.
 
-- `header("X-Name")` — existence check → **value is logged**
-- `header("X-Name:value")` — value match → **not logged** (value is already in the rule)
-- Multiple headers in a rule → all existence-only headers are logged
+- `header("X-Customer-Id")` — existence check → **value is logged**
+- `header("X-Name:value")` — value match → **value is logged**
+- Multiple headers in a rule → all referenced headers are logged
 
 ```json
-{"method":"GET","host":"api.example.com","path":"/api/users","rule":"track-customer","action":"forward","headers":{"X-Customer-Id":"cust-12345"}}
+{"method":"GET","host":"api.example.com","path":"/api/users","rule":"track-customer","action":"forward","headers":{"X-Customer-Id":"cust-12345","X-Version":"v2"}}
 ```

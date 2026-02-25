@@ -1,7 +1,7 @@
 
 # Roxy
 
-![](./logo.png)
+![](./logo.svg)
 
 [![Docker Hub](https://img.shields.io/docker/v/adsanz/roxy?label=Docker%20Hub)](https://hub.docker.com/r/adsanz/roxy)
 
@@ -16,6 +16,7 @@ Roxy combines ACL filtering, header mangling, rate limiting, and TLS inspection 
 - **Rate Limiting** — Sliding window rate limiter with soft/hard limits and progressive throttling ([docs](docs/rate-limiting.md))
 - **Credit System** — Fixed-budget rate limiting with scheduled resets ([docs](docs/rate-limiting.md))
 - **Header Mangling** — Add/remove headers based on rule matches
+- **Hot Reload** — Automatic config reload without restart, preserving rate limit and credit state
 - **Method-Indexed Rules** — O(1) rule lookup by HTTP method
 - **Memory-Conscious** — jemalloc allocator, configurable caches and pools ([docs](docs/memory-tuning.md))
 
@@ -114,19 +115,50 @@ For rate limiting, credit system, throttling, and reset schedules, see [Rate Lim
 
 For memory tuning (jemalloc, cert cache, connection pool), see [Memory Tuning docs](docs/memory-tuning.md).
 
+## Hot Reload
+
+Roxy automatically detects config file changes and reloads rules, headers, and throttle settings without restarting the proxy. Rate limit counters and credit budgets are **preserved** across reloads.
+
+```yaml
+# Check for config changes every 5 seconds (default)
+reload_interval_secs: 5
+
+# Disable hot reload
+reload_interval_secs: 0
+```
+
+**What reloads:** rules, header mangle config, throttle config, credit rule budgets.
+
+**What is preserved:** rate limit sliding windows, credit usage counters, TLS certificates, connection pools.
+
+**Delta-aware budget changes:**
+
+- **Rate limits** — When you change e.g. `rate_limit(10/s)` → `rate_limit(15/s)`, existing sliding window counters are kept and the new limit applies immediately on the next request. No traffic spike from a counter reset.
+- **Credits** — When you change e.g. `credit(100/d)` → `credit(200/d)`, the current usage is preserved and the extra capacity is available right away. A client that used 60 of 100 credits now has 140 remaining instead of being reset to 200.
+- **Decreases** work the same way: lowering a rate limit or credit budget takes effect instantly. Clients already over the new limit will be rejected until counters naturally expire or reset.
+
+If a new config fails to parse or contains invalid rules, the current config remains active and an error is logged.
+
 ## Architecture
 
 ```
-Request → [TLS Intercept] → [Parse] → [ACL] → [RateLimit] → [Mangle] → [Forward] → Response
+Request → [TLS Intercept] → [Parse] → [ACL] → [RateLimit / Credit / Throttle] → [Mangle] → [Forward] → Response
 ```
 
 | Module | Responsibility |
 |--------|----------------|
-| `config/` | YAML config parsing |
-| `rules/` | DSL parsing (nom) + method-indexed evaluation |
-| `ratelimit/` | Sliding window + credit-based rate limiting |
-| `proxy/` | Hudsucker `HttpHandler` implementation |
+| `config/types.rs` | YAML config parsing and validation |
+| `config/reload.rs` | Periodic config file watcher, delta-aware hot reload |
+| `rules/parser.rs` | DSL parsing (nom) |
+| `rules/ast.rs` | Expression types and evaluation |
+| `rules/engine.rs` | Method-indexed rule matching |
+| `rules/key.rs` | Key extraction for rate limiting (IP, header, composite) |
+| `ratelimit/limiter.rs` | Sliding window rate limiting (DashMap) |
+| `ratelimit/credit.rs` | Credit-based rate limiting with scheduled resets |
+| `proxy/handler.rs` | Hudsucker `HttpHandler` — request/response pipeline |
+| `proxy/authority.rs` | Custom CA with full certificate chain for MITM |
 | `error.rs` | Unified error types |
+| `util.rs` | Stack-allocated string utilities (zero-alloc key formatting) |
 
 ### Key Dependencies
 
@@ -136,6 +168,7 @@ Request → [TLS Intercept] → [Parse] → [ACL] → [RateLimit] → [Mangle] �
 | [nom](https://crates.io/crates/nom) | Zero-copy parser combinators for the rule DSL |
 | [globset](https://crates.io/crates/globset) | Pre-compiled glob pattern matching |
 | [dashmap](https://crates.io/crates/dashmap) | Concurrent hashmap for rate limit storage |
+| [arc-swap](https://crates.io/crates/arc-swap) | Lock-free atomic config swap for hot reload |
 | [tikv-jemallocator](https://crates.io/crates/tikv-jemallocator) | jemalloc global allocator |
 | [tokio](https://crates.io/crates/tokio) | Async runtime |
 | [tracing](https://crates.io/crates/tracing) | Structured logging |

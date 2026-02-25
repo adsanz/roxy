@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 620" width="500" height="620">
+  <defs>
+    <!-- Background Gradient -->
+    <radialGradient id="bgGrad" cx="50%" cy="40%" r="60%">
+      <stop offset="0%" stop-color="#0F172A" />
+      <stop offset="100%" stop-color="#020617" />
+    </radialGradient>
+
+    <!-- Hexagon Glass Effect -->
+    <linearGradient id="hexGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#334155" stop-opacity="0.6" />
+      <stop offset="100%" stop-color="#0F172A" stop-opacity="0.1" />
+    </linearGradient>
+
+    <!-- "R" Monogram Gradients (High-Performance Tech Spectrum) -->
+    <linearGradient id="stemGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#3B82F6" /> <!-- Blue 500 -->
+      <stop offset="100%" stop-color="#8B5CF6" /> <!-- Violet 500 -->
+    </linearGradient>
+
+    <linearGradient id="loopGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8B5CF6" /> <!-- Violet 500 -->
+      <stop offset="100%" stop-color="#EC4899" /> <!-- Pink 500 -->
+    </linearGradient>
+
+    <linearGradient id="leg1Grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#EC4899" /> <!-- Pink 500 -->
+      <stop offset="100%" stop-color="#F43F5E" /> <!-- Rose 500 -->
+    </linearGradient>
+
+    <linearGradient id="leg2Grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F43F5E" /> <!-- Rose 500 -->
+      <stop offset="100%" stop-color="#F59E0B" /> <!-- Amber 500 -->
+    </linearGradient>
+
+    <!-- Drop Shadows for 3D Layering -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000" flood-opacity="0.5" />
+      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#000" flood-opacity="0.3" />
+    </filter>
+
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="16" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Solid Background to ensure it looks good everywhere -->
+  <rect width="100%" height="100%" fill="url(#bgGrad)" rx="40" />
+
+  <!-- Outer Glow behind the Hexagon -->
+  <polygon points="250,40 440.5,150 440.5,370 250,480 59.5,370 59.5,150" fill="#3B82F6" opacity="0.05" filter="url(#glow)" />
+
+  <!-- The Proxy Node (Hexagon Shield) -->
+  <polygon points="250,40 440.5,150 440.5,370 250,480 59.5,370 59.5,150" fill="url(#hexGrad)" stroke="#1E293B" stroke-width="4" />
+  
+  <!-- Inner Tech Grid / Routing Lines -->
+  <g stroke="#1E293B" stroke-width="2" opacity="0.6">
+    <line x1="59.5" y1="150" x2="440.5" y2="370" />
+    <line x1="59.5" y1="370" x2="440.5" y2="150" />
+    <line x1="250" y1="40" x2="250" y2="480" />
+  </g>
+
+  <!-- Data Particles on the Grid -->
+  <circle cx="154.75" cy="260" r="4" fill="#38BDF8" filter="url(#glow)" opacity="0.8" />
+  <circle cx="345.25" cy="260" r="4" fill="#F43F5E" filter="url(#glow)" opacity="0.8" />
+  <circle cx="250" cy="150" r="4" fill="#8B5CF6" filter="url(#glow)" opacity="0.8" />
+
+  <!-- The "R" Monogram (Centered in the Hexagon) -->
+  <g transform="translate(5, 30)">
+    
+    <!-- Left Stem (The Foundation) -->
+    <rect x="140" y="100" width="44" height="260" rx="22" fill="url(#stemGrad)" filter="url(#shadow)" />
+
+    <!-- Top Loop (The Route) -->
+    <path d="M 162 122 L 290 122 A 58 58 0 0 1 290 238 L 162 238" fill="none" stroke="url(#loopGrad)" stroke-width="44" stroke-linecap="round" filter="url(#shadow)" />
+
+    <!-- Right Leg 1 (Forward Arrow Part 1) -->
+    <line x1="220" y1="238" x2="280" y2="338" stroke="url(#leg1Grad)" stroke-width="44" stroke-linecap="round" filter="url(#shadow)" />
+
+    <!-- Right Leg 2 (Forward Arrow Part 2) -->
+    <line x1="290" y1="238" x2="350" y2="338" stroke="url(#leg2Grad)" stroke-width="44" stroke-linecap="round" filter="url(#shadow)" />
+
+  </g>
+
+  <!-- Typography -->
+  <text x="250" y="550" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="56" font-weight="900" fill="#F8FAFC" text-anchor="middle" letter-spacing="10">ROXY</text>
+  
+  <text x="250" y="585" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="18" font-weight="700" fill="#94A3B8" text-anchor="middle" letter-spacing="8">FORWARD PROXY</text>
+
+</svg>

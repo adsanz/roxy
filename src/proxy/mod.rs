@@ -7,3 +7,4 @@ mod handler;
 
 pub use authority::RoxyAuthority;
 pub use handler::RoxyHandler;
+pub use handler::SharedConfig;
