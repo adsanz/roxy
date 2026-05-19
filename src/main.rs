@@ -451,7 +451,7 @@ async fn main() {
         http_connector.set_keepalive(Some(Duration::from_secs(15)));
 
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots() // <--- CHANGED THIS LINE
+            .with_webpki_roots()
             .https_or_http()
             .enable_http1()
             .enable_http2()
