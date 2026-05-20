@@ -9,7 +9,6 @@ on:
 
 jobs:
   build:
-    if: github.repository == 'berney/roxy'
     runs-on: ubuntu-latest
     env:
       REGISTRY: ghcr.io
