@@ -116,13 +116,21 @@ fn default_cert_cache_size() -> usize {
 }
 
 /// A single access control rule.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RuleConfig {
     /// Unique name for the rule (used in logs and header mangle refs)
     pub name: String,
 
     /// Rule DSL expression (e.g., 'host("*.internal") && !header("X-Auth") = block')
     pub rule: String,
+
+    /// Optional per-rule log level for user-facing `proxy`-target events
+    /// (`forward`, `block`, `rate_limited`, `credit_exhausted`).
+    /// Allowed values (case-insensitive): `trace`, `debug`, `info`, `warn`, `error`, `off`.
+    /// Defaults to `info` when omitted.
+    /// Does NOT affect internal `debug!(target: "rules", ...)` traces for `pass`/`mangle`.
+    #[serde(default)]
+    pub log_level: Option<String>,
 }
 
 /// Header manipulation configuration.
@@ -243,6 +251,17 @@ impl ProxyConfig {
                 return Err(ConfigError::Invalid(format!(
                     "Duplicate rule name: {}",
                     rule.name
+                )));
+            }
+            if let Some(ref lvl) = rule.log_level
+                && !matches!(
+                    lvl.to_ascii_lowercase().as_str(),
+                    "trace" | "debug" | "info" | "warn" | "error" | "off"
+                )
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "Rule '{}': invalid log_level '{}' (expected one of: trace, debug, info, warn, error, off)",
+                    rule.name, lvl
                 )));
             }
         }
@@ -747,5 +766,51 @@ credits:
 "#;
         let config = ProxyConfig::from_str(yaml).unwrap();
         assert!(config.credits[0].message.contains("reset_time"));
+    }
+
+    #[test]
+    fn test_rule_log_level_omitted_defaults_to_none() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+rules:
+  - name: "block-rule"
+    rule: 'host("*.internal") = block'
+"#;
+        let config = ProxyConfig::from_str(yaml).unwrap();
+        assert!(config.rules[0].log_level.is_none());
+    }
+
+    #[test]
+    fn test_rule_log_level_valid_values_accepted() {
+        for level in [
+            "trace", "debug", "info", "warn", "error", "off", "OFF", "Debug",
+        ] {
+            let yaml = format!(
+                r#"
+listen: "0.0.0.0:8080"
+rules:
+  - name: "r"
+    rule: 'host("*") = pass'
+    log_level: "{level}"
+"#
+            );
+            let config = ProxyConfig::from_str(&yaml)
+                .unwrap_or_else(|e| panic!("expected log_level '{level}' to be accepted, got {e}"));
+            assert_eq!(config.rules[0].log_level.as_deref(), Some(level));
+        }
+    }
+
+    #[test]
+    fn test_rule_log_level_invalid_value_rejected() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+rules:
+  - name: "r"
+    rule: 'host("*") = pass'
+    log_level: "verbose"
+"#;
+        let err = ProxyConfig::from_str(yaml).unwrap_err().to_string();
+        assert!(err.contains("invalid log_level"), "unexpected error: {err}");
+        assert!(err.contains("verbose"), "unexpected error: {err}");
     }
 }

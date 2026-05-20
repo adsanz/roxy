@@ -14,10 +14,29 @@ use std::error::Error as _;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
+/// Emit a `tracing` event at a runtime-selected level.
+///
+/// `tracing`'s event macros require a const `Level`, so per-rule log levels
+/// (carried on `CompiledRule`) need this runtime dispatcher. `LogLevel::Off`
+/// suppresses the event entirely.
+macro_rules! log_at {
+    ($level:expr, $($rest:tt)*) => {
+        match $level {
+            $crate::rules::LogLevel::Trace => tracing::trace!($($rest)*),
+            $crate::rules::LogLevel::Debug => tracing::debug!($($rest)*),
+            $crate::rules::LogLevel::Info => tracing::info!($($rest)*),
+            $crate::rules::LogLevel::Warn => tracing::warn!($($rest)*),
+            $crate::rules::LogLevel::Error => tracing::error!($($rest)*),
+            $crate::rules::LogLevel::Off => {}
+        }
+    };
+}
+
 use crate::config::{HeaderMangleConfig, ThrottleConfig};
 use crate::ratelimit::{CreditManager, CreditResult, RateLimitResult, RateLimiter};
 use crate::rules::{
-    Action, EvalContext, KeyExpr, LoggedHeaders, RuleIndex, RuleMatch, extract_ip_key, extract_key,
+    Action, EvalContext, KeyExpr, LogLevel, LoggedHeaders, RuleIndex, RuleMatch, extract_ip_key,
+    extract_key,
 };
 
 /// Pre-parsed header to add (parsed once at startup, not per-request).
@@ -349,17 +368,21 @@ impl HttpHandler for RoxyHandler {
         // Process rule result - collect info for single log at forward time
         let mut matched_rule: &str = "";
         let mut matched_headers = LoggedHeaders::default();
+        let mut matched_log_level = LogLevel::Info;
 
         if let Some(rule_match) = result {
             let RuleMatch {
                 rule_name,
                 logged_headers,
                 action,
+                log_level,
             } = rule_match;
+            matched_log_level = log_level;
 
             match action {
                 Action::Block => {
-                    info!(
+                    log_at!(
+                        log_level,
                         target: "proxy",
                         method = %method,
                         host = %host,
@@ -410,7 +433,8 @@ impl HttpHandler for RoxyHandler {
                             remaining: 0,
                             reset_after_secs: retry_after_secs,
                         };
-                        info!(
+                        log_at!(
+                            log_level,
                             target: "proxy",
                             method = %method,
                             host = %host,
@@ -467,7 +491,8 @@ impl HttpHandler for RoxyHandler {
                                 remaining: 0,
                                 reset_after_secs: retry_after_secs,
                             };
-                            info!(
+                            log_at!(
+                                log_level,
                                 target: "proxy",
                                 method = %method,
                                 host = %host,
@@ -539,7 +564,8 @@ impl HttpHandler for RoxyHandler {
                             let message = self
                                 .credit_manager
                                 .format_exhaustion_message(rule_name, &reset_time);
-                            info!(
+                            log_at!(
+                                log_level,
                                 target: "proxy",
                                 method = %method,
                                 host = %host,
@@ -602,7 +628,8 @@ impl HttpHandler for RoxyHandler {
                             remaining: 0,
                             reset_after_secs: retry_after_secs,
                         };
-                        info!(
+                        log_at!(
+                            log_level,
                             target: "proxy",
                             method = %method,
                             host = %host,
@@ -634,7 +661,8 @@ impl HttpHandler for RoxyHandler {
                                 remaining: 0,
                                 reset_after_secs: retry_after_secs,
                             };
-                            info!(
+                            log_at!(
+                                log_level,
                                 target: "proxy",
                                 method = %method,
                                 host = %host,
@@ -678,7 +706,8 @@ impl HttpHandler for RoxyHandler {
                                     let message = self
                                         .credit_manager
                                         .format_exhaustion_message(rule_name, &reset_time);
-                                    info!(
+                                    log_at!(
+                                        log_level,
                                         target: "proxy",
                                         method = %method,
                                         host = %host,
@@ -786,7 +815,8 @@ impl HttpHandler for RoxyHandler {
                 action = "forward",
             );
         } else if matched_headers.is_empty() {
-            info!(
+            log_at!(
+                matched_log_level,
                 target: "proxy",
                 method = %method,
                 host = %host,
@@ -795,7 +825,8 @@ impl HttpHandler for RoxyHandler {
                 action = "forward",
             );
         } else {
-            info!(
+            log_at!(
+                matched_log_level,
                 target: "proxy",
                 method = %method,
                 host = %host,
@@ -1195,6 +1226,7 @@ mod tests {
         let mut handler = make_handler_with_rules(vec![RuleConfig {
             name: "block-all".to_string(),
             rule: r#"host("*") = block"#.to_string(),
+            ..Default::default()
         }]);
         let http_ctx = make_http_ctx(test_addr());
         let req = Request::builder()
@@ -1217,6 +1249,7 @@ mod tests {
         let mut handler = make_handler_with_rules(vec![RuleConfig {
             name: "block-internal".to_string(),
             rule: r#"host("*.internal") = block"#.to_string(),
+            ..Default::default()
         }]);
         let http_ctx = make_http_ctx(test_addr());
         let req = Request::builder()
@@ -1238,6 +1271,7 @@ mod tests {
         let mut handler = make_handler_with_rules(vec![RuleConfig {
             name: "allow-api".to_string(),
             rule: r#"host("api.*") = pass"#.to_string(),
+            ..Default::default()
         }]);
         let http_ctx = make_http_ctx(test_addr());
         let req = Request::builder()
@@ -1259,6 +1293,7 @@ mod tests {
         let mut handler = make_handler_with_rules(vec![RuleConfig {
             name: "only-internal".to_string(),
             rule: r#"host("*.internal") = block"#.to_string(),
+            ..Default::default()
         }]);
         let http_ctx = make_http_ctx(test_addr());
         let req = Request::builder()
@@ -1280,6 +1315,7 @@ mod tests {
         let mut handler = make_handler_with_rules(vec![RuleConfig {
             name: "require-auth".to_string(),
             rule: r#"header("X-Auth") = pass : block"#.to_string(),
+            ..Default::default()
         }]);
         let http_ctx = make_http_ctx(test_addr());
 
@@ -1303,6 +1339,7 @@ mod tests {
         let mut handler = make_handler_with_rules(vec![RuleConfig {
             name: "require-auth".to_string(),
             rule: r#"header("X-Auth") = pass : block"#.to_string(),
+            ..Default::default()
         }]);
         let http_ctx = make_http_ctx(test_addr());
 
@@ -1325,6 +1362,7 @@ mod tests {
         let mut handler = make_handler_with_rules(vec![RuleConfig {
             name: "rate-api".to_string(),
             rule: r#"host("api.*") = rate_limit(100/s, ip)"#.to_string(),
+            ..Default::default()
         }]);
         let http_ctx = make_http_ctx(test_addr());
         let req = Request::builder()
@@ -1346,6 +1384,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "rate-api".to_string(),
             rule: r#"host("api.*") = rate_limit(2/s, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let mut handler = make_handler(index, vec![], vec![]);
@@ -1381,6 +1420,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "mangle-rule".to_string(),
             rule: r#"host("api.*") = mangle"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let header_configs = vec![HeaderMangleConfig {
@@ -1418,6 +1458,7 @@ mod tests {
         let mut handler = make_handler_with_rules(vec![RuleConfig {
             name: "rate-api".to_string(),
             rule: r#"host("api.*") = rate_limit(100/s, ip)"#.to_string(),
+            ..Default::default()
         }]);
         let http_ctx = make_http_ctx(test_addr());
 
@@ -1452,6 +1493,7 @@ mod tests {
         let mut handler = make_handler_with_rules(vec![RuleConfig {
             name: "rate-by-header".to_string(),
             rule: r#"host("api.*") = rate_limit(100/s, header(X-Customer-Id))"#.to_string(),
+            ..Default::default()
         }]);
         let http_ctx = make_http_ctx(test_addr());
 
@@ -1479,6 +1521,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "credit-rule".to_string(),
             rule: r#"host("api.*") = credit(1000/d, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -1517,6 +1560,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "credit-rule".to_string(),
             rule: r#"host("api.*") = credit(2/d, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -1561,6 +1605,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "rl-mangle".to_string(),
             rule: r#"host("api.*") = rate_limit(100/s, ip) + mangle"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let header_configs = vec![HeaderMangleConfig {
@@ -1596,6 +1641,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "composite-rule".to_string(),
             rule: r#"host("api.*") = rate_limit(100/s, ip) + credit(1000/d, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -1634,6 +1680,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "rl-header".to_string(),
             rule: r#"host("api.*") = rate_limit(2/s, header(X-Id))"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let mut handler = make_handler(index, vec![], vec![]);
@@ -1670,6 +1717,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "rl-throttle".to_string(),
             rule: r#"host("api.*") = rate_limit(10/s, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let throttle = vec![ThrottleConfig {
@@ -1703,6 +1751,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "credit-mangle".to_string(),
             rule: r#"host("api.*") = credit(1000/d, ip) + mangle"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -1750,6 +1799,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "credit-throttle".to_string(),
             rule: r#"host("api.*") = credit(10/d, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -1788,6 +1838,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "credit-thr-m".to_string(),
             rule: r#"host("api.*") = credit(10/d, ip) + mangle"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -1845,6 +1896,7 @@ mod tests {
             name: "rlc-ip".to_string(),
             rule: r#"host("api.*") = rate_limit(2/s, header(X-Id)) + credit(1000/d, ip)"#
                 .to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -1895,6 +1947,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "rlc-rl".to_string(),
             rule: r#"host("api.*") = rate_limit(2/s, ip) + credit(1000/d, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -1943,6 +1996,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "rlc-cx".to_string(),
             rule: r#"host("api.*") = rate_limit(100/s, ip) + credit(2/d, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -1991,6 +2045,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "rlc-ct".to_string(),
             rule: r#"host("api.*") = rate_limit(100/s, ip) + credit(10/d, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -2032,6 +2087,7 @@ mod tests {
             name: "rlc-ctm".to_string(),
             rule: r#"host("api.*") = rate_limit(100/s, ip) + credit(10/d, ip) + mangle"#
                 .to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -2088,6 +2144,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "rlc-art".to_string(),
             rule: r#"host("api.*") = rate_limit(10/s, ip) + credit(1000/d, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -2134,6 +2191,7 @@ mod tests {
             name: "rlc-artm".to_string(),
             rule: r#"host("api.*") = rate_limit(10/s, ip) + credit(1000/d, ip) + mangle"#
                 .to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let credit_manager = Arc::new(CreditManager::new());
@@ -2193,6 +2251,7 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "rl-pk".to_string(),
             rule: r#"host("api.*") = rate_limit(2/s, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let mut handler = make_handler(index, vec![], vec![]);

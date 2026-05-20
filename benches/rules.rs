@@ -168,6 +168,7 @@ fn bench_mangle_evaluation(c: &mut Criterion) {
                 RuleConfig {
                     name: format!("mangle-{}", i),
                     rule: format!(r#"host("backend-{}.internal") = mangle"#, i),
+                    ..Default::default()
                 }
             } else {
                 generate_rule(i, Complexity::Medium)

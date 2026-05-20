@@ -34,6 +34,8 @@ pub struct RuleMatch<'idx, 'req> {
     pub logged_headers: LoggedHeaders<'req>,
     /// The action to take (borrowed from RuleIndex)
     pub action: &'idx Action,
+    /// Per-rule log level for the matched-rule log entry.
+    pub log_level: LogLevel,
 }
 
 /// Zero-allocation container for logged header key-value pairs.
@@ -182,7 +184,20 @@ impl RuleIndex {
 
         for rule_config in rules {
             match parse_rule(&rule_config.name, &rule_config.rule) {
-                Ok(compiled) => index.add_rule(compiled),
+                Ok(compiled) => {
+                    // Apply per-rule log level. Validation happens at config
+                    // load time (see `ProxyConfig::validate`), so an unknown
+                    // value here is treated as the default `Info` rather than
+                    // aborting compilation.
+                    let level = rule_config
+                        .log_level
+                        .as_deref()
+                        .map(LogLevel::parse)
+                        .transpose()
+                        .unwrap_or(None)
+                        .unwrap_or_default();
+                    index.add_rule(compiled.with_log_level(level));
+                }
                 Err(e) => errors.push(e),
             }
         }
@@ -354,6 +369,7 @@ impl RuleIndex {
                     rule_name: &rule.name,
                     logged_headers,
                     action,
+                    log_level: rule.log_level,
                 });
             }
         }
@@ -552,14 +568,17 @@ mod tests {
             RuleConfig {
                 name: "allow-health".to_string(),
                 rule: r#"path("/health") = pass"#.to_string(),
+                ..Default::default()
             },
             RuleConfig {
                 name: "allow-payment".to_string(),
                 rule: r#"method(POST) && path("/payment") = pass"#.to_string(),
+                ..Default::default()
             },
             RuleConfig {
                 name: "block-all".to_string(),
                 rule: r#"host("*") = block"#.to_string(),
+                ..Default::default()
             },
         ];
 
@@ -615,10 +634,12 @@ mod tests {
             RuleConfig {
                 name: "rule1".to_string(),
                 rule: r#"host("*.internal") = block"#.to_string(),
+                ..Default::default()
             },
             RuleConfig {
                 name: "rule2".to_string(),
                 rule: r#"method(GET) = pass"#.to_string(),
+                ..Default::default()
             },
         ];
 
@@ -632,14 +653,17 @@ mod tests {
             RuleConfig {
                 name: "good-rule".to_string(),
                 rule: r#"host("*.com") = block"#.to_string(),
+                ..Default::default()
             },
             RuleConfig {
                 name: "bad-rule-1".to_string(),
                 rule: "".to_string(), // empty expression
+                ..Default::default()
             },
             RuleConfig {
                 name: "bad-rule-2".to_string(),
                 rule: r#"host("[invalid") = block"#.to_string(), // bad glob
+                ..Default::default()
             },
         ];
 
@@ -669,14 +693,17 @@ mod tests {
             RuleConfig {
                 name: "rule-a".to_string(),
                 rule: r#"host("api.*") && path("/v1/*") = block"#.to_string(),
+                ..Default::default()
             },
             RuleConfig {
                 name: "rule-b".to_string(),
                 rule: r#"host("api.*") && path("/v1/*") = pass"#.to_string(),
+                ..Default::default()
             },
             RuleConfig {
                 name: "rule-c".to_string(),
                 rule: r#"host("other.*") = block"#.to_string(),
+                ..Default::default()
             },
         ];
 
@@ -954,10 +981,12 @@ mod tests {
             RuleConfig {
                 name: "allow-healthcheck".to_string(),
                 rule: r#"path("/health") && method(GET) = pass"#.to_string(),
+                ..Default::default()
             },
             RuleConfig {
                 name: "block-all".to_string(),
                 rule: r#"host("*") = block"#.to_string(),
+                ..Default::default()
             },
         ];
 
@@ -1047,10 +1076,12 @@ mod tests {
             RuleConfig {
                 name: "ternary".to_string(),
                 rule: r#"header("X-Auth") = pass : block"#.to_string(),
+                ..Default::default()
             },
             RuleConfig {
                 name: "unreachable".to_string(),
                 rule: r#"host("*") = block"#.to_string(),
+                ..Default::default()
             },
         ];
         let index = RuleIndex::from_config(&rules).unwrap();
@@ -1065,10 +1096,12 @@ mod tests {
             RuleConfig {
                 name: "get-ternary".to_string(),
                 rule: r#"method(GET) && header("X-Auth") = pass : block"#.to_string(),
+                ..Default::default()
             },
             RuleConfig {
                 name: "get-after".to_string(),
                 rule: r#"method(GET) && host("*") = pass"#.to_string(),
+                ..Default::default()
             },
         ];
         let index = RuleIndex::from_config(&rules).unwrap();
@@ -1121,11 +1154,67 @@ mod tests {
         let rules = vec![RuleConfig {
             name: "composite".to_string(),
             rule: r#"host("*") = rate_limit(100/s, ip) + credit(5000/d, ip)"#.to_string(),
+            ..Default::default()
         }];
         let index = RuleIndex::from_config(&rules).unwrap();
         let budgets = index.credit_budgets();
         assert_eq!(budgets.len(), 1);
         assert_eq!(budgets[0].0, "composite");
         assert_eq!(budgets[0].1, 5000);
+    }
+
+    // === Per-rule log level ===
+
+    #[test]
+    fn test_rule_match_default_log_level_is_info() {
+        let rules = vec![RuleConfig {
+            name: "blk".to_string(),
+            rule: r#"host("*") = block"#.to_string(),
+            ..Default::default()
+        }];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let headers = HeaderMap::new();
+        let ctx = make_ctx("anything", "/", &Method::GET, &headers);
+        let m = index.evaluate(&ctx).unwrap();
+        assert_eq!(m.log_level, LogLevel::Info);
+    }
+
+    #[test]
+    fn test_rule_match_uses_configured_log_level() {
+        let rules = vec![
+            RuleConfig {
+                name: "quiet".to_string(),
+                rule: r#"host("*.quiet") = pass"#.to_string(),
+                log_level: Some("off".to_string()),
+            },
+            RuleConfig {
+                name: "noisy".to_string(),
+                rule: r#"host("*.noisy") = block"#.to_string(),
+                log_level: Some("Warn".to_string()),
+            },
+        ];
+        let index = RuleIndex::from_config(&rules).unwrap();
+        let headers = HeaderMap::new();
+
+        let ctx = make_ctx("api.quiet", "/", &Method::GET, &headers);
+        let m = index.evaluate(&ctx).unwrap();
+        assert_eq!(m.rule_name, "quiet");
+        assert_eq!(m.log_level, LogLevel::Off);
+
+        let ctx = make_ctx("api.noisy", "/", &Method::GET, &headers);
+        let m = index.evaluate(&ctx).unwrap();
+        assert_eq!(m.rule_name, "noisy");
+        assert_eq!(m.log_level, LogLevel::Warn);
+    }
+
+    #[test]
+    fn test_log_level_parse() {
+        assert_eq!(LogLevel::parse("trace").unwrap(), LogLevel::Trace);
+        assert_eq!(LogLevel::parse("DEBUG").unwrap(), LogLevel::Debug);
+        assert_eq!(LogLevel::parse("Info").unwrap(), LogLevel::Info);
+        assert_eq!(LogLevel::parse("warn").unwrap(), LogLevel::Warn);
+        assert_eq!(LogLevel::parse("error").unwrap(), LogLevel::Error);
+        assert_eq!(LogLevel::parse("off").unwrap(), LogLevel::Off);
+        assert!(LogLevel::parse("verbose").is_err());
     }
 }

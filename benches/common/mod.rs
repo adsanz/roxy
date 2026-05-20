@@ -99,7 +99,11 @@ pub fn generate_rule(index: usize, complexity: Complexity) -> RuleConfig {
         },
     };
 
-    RuleConfig { name, rule }
+    RuleConfig {
+        name,
+        rule,
+        ..Default::default()
+    }
 }
 
 /// Generate a batch of rules with specified count and complexity

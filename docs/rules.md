@@ -149,3 +149,35 @@ When a rule matches, Roxy automatically logs the actual values of **all headers 
 ```json
 {"method":"GET","host":"api.example.com","path":"/api/users","rule":"track-customer","action":"forward","headers":{"X-Customer-Id":"cust-12345","X-Version":"v2"}}
 ```
+
+## Per-Rule Log Level
+
+Each rule can opt into a different log level for the matched-rule entry the proxy emits (the `proxy` target entry that includes `rule=...` and `action=...`). When `log_level` is omitted, matched-rule entries are emitted at `info` — the historical default.
+
+Accepted values (case-insensitive) match the `tracing` crate plus an extra `off`:
+
+| Value | Effect |
+|-------|--------|
+| `trace` | Emit at trace |
+| `debug` | Emit at debug |
+| `info` | Emit at info (default) |
+| `warn` | Emit at warn |
+| `error` | Emit at error |
+| `off` | Suppress the matched-rule log entry entirely |
+
+```yaml
+rules:
+  # Health-check spam: keep the rule active but stop logging every hit
+  - name: "allow-healthcheck"
+    rule: 'path("/health") && method(GET) = pass'
+    log_level: off
+
+  # Anything matching this rule is suspicious — log loudly
+  - name: "block-admin-from-outside"
+    rule: 'path("/admin/*") && !header("X-Internal") = block'
+    log_level: warn
+```
+
+Notes:
+
+- Invalid values are rejected at config load (the proxy will refuse to start).
