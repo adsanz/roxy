@@ -385,10 +385,42 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // ---------------------------------------------------------
+    // Inbound TCP Keepalive via socket2 - prevents zombie connections when clients disappear without proper TCP teardown (e.g. mobile clients, bad network, OOM kills inside containers...)
+    // ---------------------------------------------------------
+    let domain = socket2::Domain::for_address(addr);
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+        .expect("Failed to create listening socket");
+
+    // Tokio requires non-blocking sockets, and we want to reuse the address
+    socket
+        .set_reuse_address(true)
+        .expect("Failed to set reuse_address");
+    socket
+        .set_nonblocking(true)
+        .expect("Failed to set nonblocking");
+
+    // Inject 15s TCP Keepalive into the Listener.
+    // Linux inherits this to all incoming client connections!
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(15))
+        .with_interval(std::time::Duration::from_secs(15));
+    socket
+        .set_tcp_keepalive(&keepalive)
+        .expect("Failed to set TCP keepalive");
+
+    socket.bind(&addr.into()).expect("Failed to bind socket");
+    socket.listen(1024).expect("Failed to listen on socket");
+
+    // Convert raw socket into a Tokio TcpListener
+    let std_listener: std::net::TcpListener = socket.into();
+    let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+        .expect("Failed to convert to Tokio TcpListener");
+
     info!(
         target: "proxy",
         listen = %addr,
-        "Starting MITM proxy"
+        "Starting MITM proxy (Inbound Keepalive Enabled)"
     );
 
     // Configure connection pool limits to prevent unbounded memory growth.
@@ -423,8 +455,8 @@ async fn main() {
 
         // Inject custom HTTP connector with 15s TCP Keepalive to kill zombie connections
         let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
-        http_connector.enforce_http(false);
         http_connector.set_keepalive(Some(Duration::from_secs(15)));
+        http_connector.enforce_http(false);
 
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(rustls_config)
@@ -434,7 +466,7 @@ async fn main() {
             .wrap_connector(http_connector);
 
         Proxy::builder()
-            .with_addr(addr)
+            .with_listener(tokio_listener)
             .with_ca(ca)
             .with_http_connector(connector)
             .with_client(client_builder)
@@ -458,7 +490,7 @@ async fn main() {
             .wrap_connector(http_connector);
 
         Proxy::builder()
-            .with_addr(addr)
+            .with_listener(tokio_listener)
             .with_ca(ca)
             .with_http_connector(connector)
             .with_client(client_builder)

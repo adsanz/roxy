@@ -48,6 +48,9 @@ tikv-jemallocator = "0.6"
 http = "1"
 hyper = "1"
 
+# Advanced networking with sockets enabled us to set inbound SO_KEEPALIVE flags on connections. This saves the proxy from origin zombie connections by dropping them after 15 seconds.
+socket2 = "0.5"
+
 # TLS — direct dep for custom upstream certificate verification
 rustls = { version = "0.23", default-features = false }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "aws-lc-rs"] }
