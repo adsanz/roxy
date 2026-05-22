@@ -311,6 +311,16 @@ impl RoxyHandler {
 
 impl HttpHandler for RoxyHandler {
     async fn handle_request(&mut self, ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
+        // Defensive reset: this handler instance is cloned per connection but
+        // reused across requests on long-lived h1 keep-alive / h2 multiplexed
+        // connections. Synthetic responses (block/429) set pending_* and
+        // bypass handle_response, leaving stale state that could leak onto
+        // a subsequent unrelated response. Clearing here makes the leak
+        // impossible regardless of which control path the previous request
+        // took.
+        self.pending_ratelimit_headers = None;
+        self.pending_credit_headers = None;
+
         // Load config snapshot once per request (single atomic load, ~2ns).
         // All rule evaluation and mangle lookups use this snapshot, ensuring
         // a consistent view even if config is swapped mid-request.
@@ -2277,6 +2287,81 @@ mod tests {
                 assert!(resp.headers().get("X-RateLimit-Limit").is_some());
             }
             _ => panic!("Expected 429 from per-key rate limit"),
+        }
+    }
+
+    /// Regression: when a request returns a synthetic response (e.g., 429),
+    /// `pending_*_headers` must not leak onto the response of a subsequent
+    /// request on the same handler instance (h1 keep-alive / h2 multiplexed).
+    #[tokio::test]
+    async fn test_pending_headers_cleared_between_requests() {
+        // Rule matches `host("api.*")` only; the second request below targets
+        // a different host so no rule matches and no pending_* gets set.
+        let mut handler = make_handler_with_rules(vec![RuleConfig {
+            name: "rate-api".to_string(),
+            rule: r#"host("api.*") = rate_limit(1/s, ip)"#.to_string(),
+            ..Default::default()
+        }]);
+        let http_ctx = make_http_ctx(test_addr());
+
+        // Request 1: matches the rule → pending_ratelimit_headers gets set
+        // (either Allowed or Limited; either way pending_* may be Some).
+        let req1 = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        let _ = handler.handle_request(&http_ctx, req1).await;
+        // Drive the rate limiter past its threshold so we get a synthetic 429,
+        // which bypasses handle_response — exactly the leak path.
+        let req2 = Request::builder()
+            .uri("http://api.example.com/data")
+            .body(Body::empty())
+            .unwrap();
+        let resp = handler.handle_request(&http_ctx, req2).await;
+        match resp {
+            RequestOrResponse::Response(r) => {
+                assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("expected synthetic 429 to confirm leak path"),
+        }
+        // At this point handler.pending_ratelimit_headers may still be set
+        // from the synthetic-response code path (it is not cleared inline).
+
+        // Request 3: targets a different host so no rule matches → no
+        // pending_* should be set. Then handle_response must NOT inject any
+        // X-RateLimit-* headers.
+        let req3 = Request::builder()
+            .uri("http://other.example.com/anything")
+            .body(Body::empty())
+            .unwrap();
+        let result = handler.handle_request(&http_ctx, req3).await;
+        match result {
+            RequestOrResponse::Request(_) => {
+                assert!(
+                    handler.pending_ratelimit_headers.is_none(),
+                    "pending_ratelimit_headers must be cleared at start of handle_request"
+                );
+                assert!(
+                    handler.pending_credit_headers.is_none(),
+                    "pending_credit_headers must be cleared at start of handle_request"
+                );
+
+                let upstream_resp = Response::builder().status(200).body(Body::empty()).unwrap();
+                let final_resp = handler.handle_response(&http_ctx, upstream_resp).await;
+                assert!(
+                    final_resp.headers().get("X-RateLimit-Limit").is_none(),
+                    "stale X-RateLimit-Limit must not leak onto response of subsequent request"
+                );
+                assert!(
+                    final_resp.headers().get("X-RateLimit-Remaining").is_none(),
+                    "stale X-RateLimit-Remaining must not leak"
+                );
+                assert!(
+                    final_resp.headers().get("X-RateLimit-Reset").is_none(),
+                    "stale X-RateLimit-Reset must not leak"
+                );
+            }
+            _ => panic!("expected request to be forwarded (no matching rule)"),
         }
     }
 }

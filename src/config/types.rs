@@ -39,6 +39,19 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub pool: Option<PoolConfig>,
 
+    /// Inbound server timeout settings (HTTP/1 header read, HTTP/2 keep-alive, etc.).
+    /// NOT hot-reloadable: server timeouts are baked into the listener at startup;
+    /// changes require a restart.
+    #[serde(default)]
+    pub server_timeouts: Option<ServerTimeoutConfig>,
+
+    /// Optional runtime metrics. Periodically logs tokio's `num_alive_tasks`
+    /// alongside the inbound connection count, useful for confirming that
+    /// connection leak fixes are taking effect.
+    /// NOT hot-reloadable: spawned at startup.
+    #[serde(default)]
+    pub runtime_metrics: Option<RuntimeMetricsConfig>,
+
     /// Throttle settings for rate_limit and credit rules (soft/hard limits)
     #[serde(default)]
     pub throttle: Vec<ThrottleConfig>,
@@ -78,6 +91,22 @@ pub struct PoolConfig {
     /// Idle connection timeout in seconds (default: 30)
     #[serde(default = "default_pool_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
+
+    /// HTTP/2 keep-alive PING interval in seconds (default: 20, 0 = disabled).
+    /// Detects dead upstream peers on pooled h2 connections. Without this,
+    /// pooled h2 connections to silently-dead upstreams accumulate until
+    /// idle_timeout_secs elapses (which only triggers when truly idle).
+    #[serde(default = "default_http2_keep_alive_interval_secs")]
+    pub http2_keep_alive_interval_secs: u64,
+
+    /// HTTP/2 keep-alive PING timeout in seconds (default: 10).
+    /// If a PING is not ACK'd within this window, the connection is closed.
+    #[serde(default = "default_http2_keep_alive_timeout_secs")]
+    pub http2_keep_alive_timeout_secs: u64,
+
+    /// Send HTTP/2 keep-alive PINGs even on idle connections (default: true).
+    #[serde(default = "default_http2_keep_alive_while_idle")]
+    pub http2_keep_alive_while_idle: bool,
 }
 
 impl Default for PoolConfig {
@@ -85,6 +114,9 @@ impl Default for PoolConfig {
         Self {
             max_idle_per_host: default_pool_max_idle_per_host(),
             idle_timeout_secs: default_pool_idle_timeout_secs(),
+            http2_keep_alive_interval_secs: default_http2_keep_alive_interval_secs(),
+            http2_keep_alive_timeout_secs: default_http2_keep_alive_timeout_secs(),
+            http2_keep_alive_while_idle: default_http2_keep_alive_while_idle(),
         }
     }
 }
@@ -95,6 +127,74 @@ fn default_pool_max_idle_per_host() -> usize {
 
 fn default_pool_idle_timeout_secs() -> u64 {
     30
+}
+
+fn default_http2_keep_alive_interval_secs() -> u64 {
+    20
+}
+
+fn default_http2_keep_alive_timeout_secs() -> u64 {
+    10
+}
+
+fn default_http2_keep_alive_while_idle() -> bool {
+    true
+}
+
+/// Inbound server timeout configuration.
+///
+/// Mitigates connection leaks where clients keep sockets open without
+/// completing protocol exchanges. NOT hot-reloadable — changes require restart.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerTimeoutConfig {
+    /// HTTP/1 header-read timeout in seconds (default: 15, 0 = disabled).
+    /// Kills slow-loris connections that open a socket and send headers
+    /// extremely slowly or never.
+    #[serde(default = "default_http1_header_read_timeout_secs")]
+    pub http1_header_read_timeout_secs: u64,
+
+    /// HTTP/2 server-side keep-alive PING interval in seconds (default: 20, 0 = disabled).
+    /// hyper sends PING frames on each idle period; if a client's connection
+    /// is dead, after `keep_alive_timeout` seconds the server sends GOAWAY
+    /// and tears down the connection.
+    #[serde(default = "default_http2_keep_alive_interval_secs")]
+    pub http2_keep_alive_interval_secs: u64,
+
+    /// HTTP/2 server-side keep-alive PING timeout in seconds (default: 10).
+    #[serde(default = "default_http2_keep_alive_timeout_secs")]
+    pub http2_keep_alive_timeout_secs: u64,
+
+    /// HTTP/2 maximum concurrent streams per connection (default: 256, 0 = unbounded).
+    /// Bounds memory amplification when a single connection multiplexes many streams.
+    #[serde(default = "default_http2_max_concurrent_streams")]
+    pub http2_max_concurrent_streams: u32,
+}
+
+impl Default for ServerTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            http1_header_read_timeout_secs: default_http1_header_read_timeout_secs(),
+            http2_keep_alive_interval_secs: default_http2_keep_alive_interval_secs(),
+            http2_keep_alive_timeout_secs: default_http2_keep_alive_timeout_secs(),
+            http2_max_concurrent_streams: default_http2_max_concurrent_streams(),
+        }
+    }
+}
+
+fn default_http1_header_read_timeout_secs() -> u64 {
+    15
+}
+
+fn default_http2_max_concurrent_streams() -> u32 {
+    256
+}
+
+/// Optional runtime metrics configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeMetricsConfig {
+    /// Interval in seconds between metric log emissions (0 = disabled).
+    #[serde(default)]
+    pub interval_secs: u64,
 }
 
 /// TLS/MITM configuration.

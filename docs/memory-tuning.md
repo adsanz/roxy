@@ -63,9 +63,19 @@ Roxy maintains a pool of keep-alive connections to upstream servers. The pool is
 
 ```yaml
 pool:
-  max_idle_per_host: 10     # Maximum idle connections per upstream host (default: 10)
-  idle_timeout_secs: 30     # Seconds before idle connections are closed (default: 30)
+  max_idle_per_host: 10                # Maximum idle connections per upstream host (default: 10)
+  idle_timeout_secs: 30                # Seconds before idle connections are closed (default: 30)
+  # HTTP/2 client keep-alive (PING dead pooled h2 connections)
+  http2_keep_alive_interval_secs: 20   # 0 = disabled (default: 20)
+  http2_keep_alive_timeout_secs: 10    # default: 10
+  http2_keep_alive_while_idle: true    # default: true
 ```
+
+### HTTP/2 Pool Keep-Alive
+
+Without HTTP/2 keep-alive PINGs, a pooled h2 connection to a silently-dead upstream (e.g., upstream OOM-killed, NAT timeout, mid-network blackhole) accumulates until `idle_timeout_secs` fires — and that timer only triggers when the connection is *truly idle*, which a stuck h2 socket with leaked streams is not. The result is a slow but persistent leak of pool slots + tokio tasks.
+
+Enabling client-side h2 keep-alive (defaults above) makes hyper send PING frames; if no ACK arrives within `http2_keep_alive_timeout_secs`, the connection is evicted from the pool immediately.
 
 ### Why Limit the Pool?
 
@@ -107,3 +117,94 @@ After warmup (all unique keys seen once), the per-request hot path allocates zer
 - **IP baseline keys** — formatted into a 128-byte stack buffer (`StackString`).
 - **Credit bucket keys** — formatted on the stack for `DashMap` lookups; only allocated on first sight of a new key.
 - **DashMap lookups** — two-phase pattern: `get_mut(&str)` fast path (zero alloc), `entry(String)` slow path only for new keys.
+
+## Inbound Server Timeouts
+
+Roxy configures the inbound `hyper-util` server with explicit timeouts. Without these (the upstream Hudsucker default), inbound sockets from misbehaving or dead clients accumulate indefinitely, leading to a slow but steady RSS / file-descriptor leak.
+
+```yaml
+server_timeouts:
+  http1_header_read_timeout_secs: 15    # default: 15, 0 = disabled
+  http2_keep_alive_interval_secs: 20    # default: 20, 0 = disabled
+  http2_keep_alive_timeout_secs: 10     # default: 10
+  http2_max_concurrent_streams: 256     # default: 256, 0 = unbounded
+```
+
+**Not hot-reloadable.** These values are baked into the listener at startup; changes require restarting the proxy.
+
+| Knob | Purpose |
+|------|---------|
+| `http1_header_read_timeout_secs` | Kills slow-loris clients that open a socket but never finish sending headers. |
+| `http2_keep_alive_interval_secs` | Server-side PING interval. Detects dead clients whose TCP socket is gone but never closed. |
+| `http2_keep_alive_timeout_secs` | If no PING ACK in this window, send GOAWAY and close. |
+| `http2_max_concurrent_streams` | Bounds per-connection multiplexing fan-out — protects against an attacker opening one h2 socket and allocating thousands of streams. |
+
+### Known Gaps (Hudsucker)
+
+The `CONNECT` initial-read, TLS handshake, and non-intercept tunnel paths cannot be timed out from Roxy's side — see [hudsucker-gaps.md](./hudsucker-gaps.md) for details and operational mitigations (kernel TCP keepalive tuning is recommended).
+
+## Runtime Metrics
+
+Roxy exposes an opt-in runtime metrics task that periodically logs tokio's live task count alongside worker count. This is the simplest way to verify connection-leak fixes are taking effect.
+
+```yaml
+runtime_metrics:
+  interval_secs: 30   # 0 or omitted = disabled
+```
+
+Log output (under `target: "runtime"`):
+
+```json
+{"target":"runtime","num_alive_tasks":42,"num_workers":4,"message":"runtime metrics"}
+```
+
+Correlate `num_alive_tasks` with `ss -tan | grep ESTAB | wc -l` to confirm sockets and tasks are released together. A widening gap = leak.
+
+**Not hot-reloadable.** The metrics task is spawned at startup.
+
+### Why `num_alive_tasks` doesn't drop back to baseline (HTTPS upstreams)
+
+If you watch `num_alive_tasks` while proxying to HTTPS sites (Google, Cloudflare, GitHub, etc.), you'll see it climb when traffic hits and then **stay elevated** — even after the requests are done and `pool_idle_timeout_secs` has elapsed. **This is normal, not a leak.**
+
+#### What's happening, in plain terms
+
+Roxy keeps a small pool of "warm" connections to each upstream so the next request to the same site is fast (no TCP/TLS handshake). For modern HTTP/2 sites, each warm connection is kept alive by a couple of background tasks. Those tasks stick around as long as the connection is in the pool.
+
+So the rule of thumb is:
+
+> **More distinct upstream hosts you've talked to recently → more warm connections → more background tasks.**
+
+The count is **bounded**: it can never exceed `max_idle_per_host × number_of_distinct_hosts`. It won't grow forever.
+
+#### How to choose your settings
+
+Pick the row that matches your workload:
+
+| Your workload | Recommended `max_idle_per_host` | Why |
+|---|---|---|
+| Many requests to the **same few** upstreams (e.g. an API gateway) | `32` (default) | Reuse warm connections → faster responses |
+| Mixed traffic, want a middle ground | `2` – `4` | Some reuse, smaller task footprint |
+| Want the **lowest** memory / task count and don't care about handshake overhead | `0` | Disables the pool entirely; tasks return to baseline immediately |
+
+Example for a low-footprint setup:
+
+```yaml
+pool:
+  max_idle_per_host: 2
+  idle_timeout_secs: 5
+```
+
+#### Tips (technical detail)
+
+- Each pooled HTTP/2 connection costs roughly **2 tokio tasks** (the h2 driver + the frame pump). Formula: `num_alive_tasks ≈ baseline + 2 × distinct_h2_hosts_in_pool`.
+- `pool_idle_timeout_secs` is honored for HTTP/1.1 idle connections but **does not promptly reap idle HTTP/2 connections** in `hyper-util` 0.1. Only evicting the pool entry (e.g. `max_idle_per_host: 0`, or pressure from new hosts) drops the tasks.
+- Setting `http2_keep_alive_while_idle: false` does **not** make h2 pool entries expire faster. Leave it `true` so dead connections are detected before the next request fails.
+- The `timer:(keepalive,...)` you see in `ss -tonp` is the **kernel's** TCP SO_KEEPALIVE, which is independent from hyper's HTTP/2 PING keep-alive. Both can be active on the same socket.
+- Measured with 3 distinct HTTPS hosts, `pool_idle_timeout_secs=5`, 30 s idle:
+
+  | Pool config | Tasks after burst | After 30 s idle | Outbound ESTAB |
+  |---|---|---|---|
+  | `max_idle_per_host=32`, `while_idle=true` | 4 → 10 | stays 10 | 2 |
+  | `max_idle_per_host=32`, `while_idle=false`, `interval=0` | 4 → 10 | stays 10 | 3 |
+  | `max_idle_per_host=0` (pool off) | stays 4 | stays 4 | 0 |
+
