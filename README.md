@@ -17,8 +17,11 @@ Roxy combines ACL filtering, header mangling, rate limiting, and TLS inspection 
 - **Credit System** — Fixed-budget rate limiting with scheduled resets ([docs](docs/rate-limiting.md))
 - **Header Mangling** — Add/remove headers based on rule matches
 - **Header Logging** — Headers referenced in rules are automatically logged with their values (up to 8 per rule, zero-allocation, configurable via `MAX_LOGGED_HEADERS`)
+- **Per-Rule Log Level** — Silence noisy-but-expected traffic with `log_level: off` (or `trace`/`debug`/`info`/`warn`/`error`) on individual rules
 - **Hot Reload** — Automatic config reload without restart, preserving rate limit and credit state
 - **Method-Indexed Rules** — O(1) rule lookup by HTTP method
+- **Stability Hardening** — Inbound server timeouts (slow-loris protection, h2 keep-alive, stream caps) and upstream HTTP/2 keep-alive prevent socket/RSS growth on long-running deployments ([docs](docs/memory-tuning.md), [hudsucker gaps](docs/hudsucker-gaps.md))
+- **Runtime Observability** — Optional periodic logging of tokio alive-task / worker count for leak detection ([docs](docs/memory-tuning.md))
 - **Memory-Conscious** — jemalloc allocator, configurable caches and pools ([docs](docs/memory-tuning.md))
 
 ## Installation
@@ -85,6 +88,8 @@ openssl req -new -x509 -days 3650 -key ca.key -out ca.crt \
     -subj "/CN=Roxy Proxy CA/O=Roxy/C=US"
 ```
 
+**Upstream certificate verification** is enabled by default. To accept self-signed or invalid upstream certificates (development / trusted networks only), set `unsafe_skip_verify: true` in the config.
+
 ## Configuration
 
 Roxy uses YAML configuration files. See [config.example.yaml](config.example.yaml) for a complete example.
@@ -95,6 +100,20 @@ listen: "0.0.0.0:8080"
 pool:
   max_idle_per_host: 50
   idle_timeout_secs: 120
+  # Detect dead pooled HTTP/2 upstreams
+  http2_keep_alive_interval_secs: 20
+  http2_keep_alive_timeout_secs: 10
+
+# Inbound server timeouts (NOT hot-reloadable — requires restart)
+server_timeouts:
+  http1_header_read_timeout_secs: 15
+  http2_keep_alive_interval_secs: 20
+  http2_keep_alive_timeout_secs: 10
+  http2_max_concurrent_streams: 256
+
+# Optional: log tokio runtime metrics every N seconds (leak detection)
+# runtime_metrics:
+#   interval_secs: 30
 
 rules:
   - name: "allow-health"
@@ -158,6 +177,7 @@ Request → [TLS Intercept] → [Parse] → [ACL] → [RateLimit / Credit / Thro
 | `ratelimit/credit.rs` | Credit-based rate limiting with scheduled resets |
 | `proxy/handler.rs` | Hudsucker `HttpHandler` — request/response pipeline |
 | `proxy/authority.rs` | Custom CA with full certificate chain for MITM |
+| `proxy/tls.rs` | Upstream TLS connector (rustls) with optional verifier skip |
 | `error.rs` | Unified error types |
 | `util.rs` | Stack-allocated string utilities (zero-alloc key formatting) |
 
@@ -268,7 +288,8 @@ Tracks:
 |-------|------|
 | Rule DSL syntax, matchers, operators, actions | [docs/rules.md](docs/rules.md) |
 | Rate limiting, credits, throttling | [docs/rate-limiting.md](docs/rate-limiting.md) |
-| Memory tuning, jemalloc, connection pool | [docs/memory-tuning.md](docs/memory-tuning.md) |
+| Memory tuning, jemalloc, connection pool, server timeouts, runtime metrics | [docs/memory-tuning.md](docs/memory-tuning.md) |
+| Hudsucker framework gaps and roxy workarounds | [docs/hudsucker-gaps.md](docs/hudsucker-gaps.md) |
 
 ## License
 
