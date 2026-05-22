@@ -72,6 +72,12 @@ rules:
   - name: "allowed-methods"
     rule: '!(method(GET) || method(POST) || method(HEAD) || method(CONNECT)) = block'
 
+  # Per-rule log level (optional). Accepted: trace, debug, info (default), warn, error, off.
+  # Use `off` to silence the matched-rule log entry for noisy but expected traffic.
+  - name: "allow-healthcheck"
+    rule: 'path("/health") && method(GET) = pass'
+    log_level: off
+
 # Header manipulation
 headers:
   - rules: ["backend-headers"]

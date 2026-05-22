@@ -27,28 +27,34 @@ fn bench_request_pipeline(c: &mut Criterion) {
         RuleConfig {
             name: "block-internal".into(),
             rule: r#"host("*.internal") || host("10.*") = block"#.into(),
+            ..Default::default()
         },
         RuleConfig {
             name: "allow-health".into(),
             rule: r#"path("/health") && method(GET) = pass"#.into(),
+            ..Default::default()
         },
         RuleConfig {
             name: "require-auth".into(),
             rule: r#"host("api.*") && !header("Authorization") = block : pass"#.into(),
+            ..Default::default()
         },
         RuleConfig {
             name: "rate-limit-api".into(),
             rule: r#"host("api.*") && path("/v1/*") = rate_limit(100/s, header(X-Customer-Id))"#
                 .into(),
+            ..Default::default()
         },
         RuleConfig {
             name: "rate-limit-composite".into(),
             rule: r#"path("/api/*") = rate_limit(50/s, header(X-Customer-Id) + path(*) + host(*))"#
                 .into(),
+            ..Default::default()
         },
         RuleConfig {
             name: "mangle-backend".into(),
             rule: r#"host("backend.*") = mangle"#.into(),
+            ..Default::default()
         },
     ];
 
@@ -154,6 +160,7 @@ fn bench_throughput(c: &mut Criterion) {
         rules.push(RuleConfig {
             name: format!("host-block-{}", i),
             rule: format!(r#"host("blocked-{}.example.com") = block"#, i),
+            ..Default::default()
         });
     }
     for i in 0..50 {
@@ -163,6 +170,7 @@ fn bench_throughput(c: &mut Criterion) {
                 r#"host("api-{}.example.com") && path("/v1/*") = rate_limit(100/s, header(X-Customer-Id))"#,
                 i
             ),
+            ..Default::default()
         });
     }
     for i in 0..50 {
@@ -172,12 +180,14 @@ fn bench_throughput(c: &mut Criterion) {
                 r#"host("svc-{}.internal") && !header("Authorization") = block : pass"#,
                 i
             ),
+            ..Default::default()
         });
     }
     for i in 0..50 {
         rules.push(RuleConfig {
             name: format!("mangle-{}", i),
             rule: format!(r#"host("backend-{}.internal") = mangle"#, i),
+            ..Default::default()
         });
     }
 

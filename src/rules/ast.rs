@@ -7,6 +7,37 @@ use http::Method;
 use http::header::{HeaderMap, HeaderName};
 use std::net::IpAddr;
 
+/// Per-rule log level used by the proxy handler when a rule matches.
+/// Defaults to `Info`. `Off` disables emission of the matched-rule log entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+    Off,
+}
+
+impl LogLevel {
+    /// Parse a log level string (case-insensitive). Accepts the standard
+    /// `tracing` levels plus `off` to disable logging.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "trace" => Ok(LogLevel::Trace),
+            "debug" => Ok(LogLevel::Debug),
+            "info" => Ok(LogLevel::Info),
+            "warn" => Ok(LogLevel::Warn),
+            "error" => Ok(LogLevel::Error),
+            "off" => Ok(LogLevel::Off),
+            other => Err(format!(
+                "invalid log_level '{other}' (expected one of: trace, debug, info, warn, error, off)"
+            )),
+        }
+    }
+}
+
 /// A compiled rule ready for evaluation.
 #[derive(Debug)]
 pub struct CompiledRule {
@@ -32,6 +63,10 @@ pub struct CompiledRule {
     /// String for the key in the logged headers HashMap.
     /// Computed once at rule compile time to avoid per-request AST traversal.
     pub logged_header_names: Vec<(HeaderName, String)>,
+
+    /// Per-rule log level for matched-rule entries emitted by the proxy handler.
+    /// Defaults to `Info`. Set via `RuleConfig::log_level` in YAML.
+    pub log_level: LogLevel,
 }
 
 /// Expression AST node.
@@ -208,7 +243,16 @@ impl CompiledRule {
             else_action,
             indexed_method,
             logged_header_names,
+            log_level: LogLevel::Info,
         }
+    }
+
+    /// Builder: set the per-rule log level. Used by the rules index when
+    /// constructing rules from config so the handler can dispatch matched-rule
+    /// log entries at the configured severity.
+    pub fn with_log_level(mut self, level: LogLevel) -> Self {
+        self.log_level = level;
+        self
     }
 
     /// Extract method for indexing if the rule has a simple method check.
