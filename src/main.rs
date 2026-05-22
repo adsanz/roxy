@@ -14,7 +14,7 @@ use hudsucker::{
     rustls::{ClientConfig, crypto::aws_lc_rs},
 };
 use hyper_util::client::legacy::Builder as ClientBuilder;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -428,15 +428,112 @@ async fn main() {
     let pool_config = config.pool.clone().unwrap_or_default();
     let mut client_builder = ClientBuilder::new(TokioExecutor::new());
     client_builder
+        .timer(TokioTimer::new())
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_secs))
         .pool_max_idle_per_host(pool_config.max_idle_per_host);
+
+    // HTTP/2 keep-alive on the upstream client: PING dead pooled connections
+    // so they are evicted promptly instead of accumulating until pool idle
+    // timeout (which only fires when the connection is fully idle, which an
+    // h2 socket with leaked streams isn't).
+    if pool_config.http2_keep_alive_interval_secs > 0 {
+        client_builder
+            .http2_keep_alive_interval(Duration::from_secs(
+                pool_config.http2_keep_alive_interval_secs,
+            ))
+            .http2_keep_alive_timeout(Duration::from_secs(
+                pool_config.http2_keep_alive_timeout_secs,
+            ))
+            .http2_keep_alive_while_idle(pool_config.http2_keep_alive_while_idle);
+    }
 
     info!(
         target: "proxy",
         pool_max_idle_per_host = pool_config.max_idle_per_host,
         pool_idle_timeout_secs = pool_config.idle_timeout_secs,
+        http2_keep_alive_interval_secs = pool_config.http2_keep_alive_interval_secs,
+        http2_keep_alive_timeout_secs = pool_config.http2_keep_alive_timeout_secs,
+        http2_keep_alive_while_idle = pool_config.http2_keep_alive_while_idle,
         "Connection pool configured"
     );
+
+    // Build a tuned inbound ServerBuilder. Without this, hudsucker falls back
+    // to a bare `hyper_util` auto::Builder with no idle/header-read/h2-keepalive
+    // timeouts, which causes inbound sockets to accumulate when clients
+    // disappear without proper teardown (the upstream hudsucker default).
+    // This builder also serves the MITM'd HTTPS streams (via internal
+    // `serve_stream`), so a single fix benefits both pipelines.
+    let timeouts = config.server_timeouts.clone().unwrap_or_default();
+    let mut server_builder =
+        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    {
+        let mut h1 = server_builder.http1();
+        // A Timer is mandatory for `header_read_timeout` to function — otherwise
+        // hyper panics with "timeout `header_read_timeout` set, but no timer set".
+        h1.timer(TokioTimer::new())
+            .title_case_headers(true)
+            .preserve_header_case(true);
+        if timeouts.http1_header_read_timeout_secs > 0 {
+            h1.header_read_timeout(Duration::from_secs(
+                timeouts.http1_header_read_timeout_secs,
+            ));
+        }
+    }
+    {
+        let mut h2 = server_builder.http2();
+        // Timer required for `keep_alive_interval` to function.
+        h2.timer(TokioTimer::new());
+        if timeouts.http2_keep_alive_interval_secs > 0 {
+            h2.keep_alive_interval(Some(Duration::from_secs(
+                timeouts.http2_keep_alive_interval_secs,
+            )))
+            .keep_alive_timeout(Duration::from_secs(
+                timeouts.http2_keep_alive_timeout_secs,
+            ));
+        }
+        if timeouts.http2_max_concurrent_streams > 0 {
+            h2.max_concurrent_streams(timeouts.http2_max_concurrent_streams);
+        }
+    }
+
+    info!(
+        target: "proxy",
+        http1_header_read_timeout_secs = timeouts.http1_header_read_timeout_secs,
+        http2_keep_alive_interval_secs = timeouts.http2_keep_alive_interval_secs,
+        http2_keep_alive_timeout_secs = timeouts.http2_keep_alive_timeout_secs,
+        http2_max_concurrent_streams = timeouts.http2_max_concurrent_streams,
+        "Inbound server timeouts configured"
+    );
+
+    // Spawn opt-in runtime metrics task. Lets operators correlate live tokio
+    // task count with `ss -tan | grep ESTAB` count to verify leak fixes.
+    if let Some(rm) = &config.runtime_metrics
+        && rm.interval_secs > 0
+    {
+        let interval_secs = rm.interval_secs;
+        let shutdown_rm = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            let handle = tokio::runtime::Handle::current();
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            interval.tick().await; // skip immediate tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let m = handle.metrics();
+                        info!(
+                            target: "runtime",
+                            num_alive_tasks = m.num_alive_tasks(),
+                            num_workers = m.num_workers(),
+                            "runtime metrics"
+                        );
+                    }
+                    _ = shutdown_rm.notified() => break,
+                }
+            }
+        });
+        info!(target: "runtime", interval_secs, "Runtime metrics task spawned");
+    }
+
 
     // Build and start proxy
     let result = if config.unsafe_skip_verify {
@@ -470,6 +567,7 @@ async fn main() {
             .with_ca(ca)
             .with_http_connector(connector)
             .with_client(client_builder)
+            .with_server(server_builder)
             .with_http_handler(handler)
             .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown)))
             .build()
@@ -494,6 +592,7 @@ async fn main() {
             .with_ca(ca)
             .with_http_connector(connector)
             .with_client(client_builder)
+            .with_server(server_builder)
             .with_http_handler(handler)
             .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown)))
             .build()

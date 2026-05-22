@@ -19,10 +19,39 @@ reload_interval_secs: 5
 # unsafe_skip_verify: true
 
 # Connection pool settings (optional)
-# Limits prevent unbounded memory growth and mitigate DoS attacks
+# Limits prevent unbounded memory growth and mitigate DoS attacks.
+# All fields below are optional with sane defaults shown.
 pool:
   max_idle_per_host: 10    # Maximum idle connections per upstream host
   idle_timeout_secs: 30    # Seconds before idle connections are closed
+  # HTTP/2 client keep-alive: PING pooled h2 connections to detect dead peers.
+  # Without this, h2 connections to silently-dead upstreams accumulate until
+  # idle_timeout_secs elapses (which only triggers when truly idle, which an
+  # h2 socket with stuck streams is not). Set interval to 0 to disable.
+  http2_keep_alive_interval_secs: 20
+  http2_keep_alive_timeout_secs: 10
+  http2_keep_alive_while_idle: true
+
+# Inbound server timeouts (optional). NOT hot-reloadable: changes require restart.
+# Without these, inbound sockets from misbehaving / dead clients accumulate
+# indefinitely (this is the root cause of socket/RSS growth observed in
+# long-running deployments).
+server_timeouts:
+  # HTTP/1 header-read timeout — kills slow-loris clients that open a socket
+  # and send headers extremely slowly (or never). Set to 0 to disable.
+  http1_header_read_timeout_secs: 15
+  # HTTP/2 server-side keep-alive PINGs — detect clients whose TCP socket is
+  # gone but never closed cleanly. Set interval to 0 to disable.
+  http2_keep_alive_interval_secs: 20
+  http2_keep_alive_timeout_secs: 10
+  # Bound multiplexing fan-out per h2 connection (0 = unbounded).
+  http2_max_concurrent_streams: 256
+
+# Optional runtime metrics (NOT hot-reloadable). Logs tokio alive-task and
+# worker count every N seconds; useful for verifying that connection leak
+# fixes are taking effect. Omit / set interval_secs to 0 to disable.
+# runtime_metrics:
+#   interval_secs: 30
 
 # Rate limit settings (optional)
 rate_limit:
