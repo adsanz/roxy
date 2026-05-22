@@ -162,3 +162,49 @@ Correlate `num_alive_tasks` with `ss -tan | grep ESTAB | wc -l` to confirm socke
 
 **Not hot-reloadable.** The metrics task is spawned at startup.
 
+### Why `num_alive_tasks` doesn't drop back to baseline (HTTPS upstreams)
+
+If you watch `num_alive_tasks` while proxying to HTTPS sites (Google, Cloudflare, GitHub, etc.), you'll see it climb when traffic hits and then **stay elevated** — even after the requests are done and `pool_idle_timeout_secs` has elapsed. **This is normal, not a leak.**
+
+#### What's happening, in plain terms
+
+Roxy keeps a small pool of "warm" connections to each upstream so the next request to the same site is fast (no TCP/TLS handshake). For modern HTTP/2 sites, each warm connection is kept alive by a couple of background tasks. Those tasks stick around as long as the connection is in the pool.
+
+So the rule of thumb is:
+
+> **More distinct upstream hosts you've talked to recently → more warm connections → more background tasks.**
+
+The count is **bounded**: it can never exceed `max_idle_per_host × number_of_distinct_hosts`. It won't grow forever.
+
+#### How to choose your settings
+
+Pick the row that matches your workload:
+
+| Your workload | Recommended `max_idle_per_host` | Why |
+|---|---|---|
+| Many requests to the **same few** upstreams (e.g. an API gateway) | `32` (default) | Reuse warm connections → faster responses |
+| Mixed traffic, want a middle ground | `2` – `4` | Some reuse, smaller task footprint |
+| Want the **lowest** memory / task count and don't care about handshake overhead | `0` | Disables the pool entirely; tasks return to baseline immediately |
+
+Example for a low-footprint setup:
+
+```yaml
+pool:
+  max_idle_per_host: 2
+  idle_timeout_secs: 5
+```
+
+#### Tips (technical detail)
+
+- Each pooled HTTP/2 connection costs roughly **2 tokio tasks** (the h2 driver + the frame pump). Formula: `num_alive_tasks ≈ baseline + 2 × distinct_h2_hosts_in_pool`.
+- `pool_idle_timeout_secs` is honored for HTTP/1.1 idle connections but **does not promptly reap idle HTTP/2 connections** in `hyper-util` 0.1. Only evicting the pool entry (e.g. `max_idle_per_host: 0`, or pressure from new hosts) drops the tasks.
+- Setting `http2_keep_alive_while_idle: false` does **not** make h2 pool entries expire faster. Leave it `true` so dead connections are detected before the next request fails.
+- The `timer:(keepalive,...)` you see in `ss -tonp` is the **kernel's** TCP SO_KEEPALIVE, which is independent from hyper's HTTP/2 PING keep-alive. Both can be active on the same socket.
+- Measured with 3 distinct HTTPS hosts, `pool_idle_timeout_secs=5`, 30 s idle:
+
+  | Pool config | Tasks after burst | After 30 s idle | Outbound ESTAB |
+  |---|---|---|---|
+  | `max_idle_per_host=32`, `while_idle=true` | 4 → 10 | stays 10 | 2 |
+  | `max_idle_per_host=32`, `while_idle=false`, `interval=0` | 4 → 10 | stays 10 | 3 |
+  | `max_idle_per_host=0` (pool off) | stays 4 | stays 4 | 0 |
+
