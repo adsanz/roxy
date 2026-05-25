@@ -1522,6 +1522,7 @@ dependencies = [
  "hudsucker",
  "hyper",
  "hyper-rustls",
+ "hyper-tungstenite",
  "hyper-util",
  "moka",
  "nom",
@@ -1536,6 +1537,8 @@ dependencies = [
  "tikv-jemallocator",
  "time",
  "tokio",
+ "tokio-graceful",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]

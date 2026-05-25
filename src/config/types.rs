@@ -72,6 +72,16 @@ pub struct ProxyConfig {
     /// WARNING: This disables all upstream TLS security. Use only in trusted networks.
     #[serde(default)]
     pub unsafe_skip_verify: bool,
+
+    /// Kernel-level TCP keep-alive settings applied to the listening socket
+    /// (inherited by every accepted client connection on Linux). Tuning these
+    /// is the only OS-level lever for detecting dead peers when the application
+    /// protocol is silent. Note: it does NOT bound the lifetime of a healthy
+    /// idle connection because live peers ACK the probes — see
+    /// `docs/hudsucker-gaps.md` Gap #5.
+    /// NOT hot-reloadable: socket options are set at startup.
+    #[serde(default)]
+    pub tcp_keepalive: Option<TcpKeepaliveConfig>,
 }
 
 fn default_reload_interval_secs() -> u64 {
@@ -154,13 +164,15 @@ pub struct ServerTimeoutConfig {
     pub http1_header_read_timeout_secs: u64,
 
     /// HTTP/2 server-side keep-alive PING interval in seconds (default: 20, 0 = disabled).
-    /// hyper sends PING frames on each idle period; if a client's connection
-    /// is dead, after `keep_alive_timeout` seconds the server sends GOAWAY
-    /// and tears down the connection.
-    #[serde(default = "default_http2_keep_alive_interval_secs")]
+    /// Detects dead h2 clients whose TCP socket is still established but whose
+    /// HTTP/2 peer no longer ACKs PINGs. Healthy idle peers will ACK forever;
+    /// use `max_connection_age_secs` to bound that echo-chamber case.
+    #[serde(default = "default_server_http2_keep_alive_interval_secs")]
     pub http2_keep_alive_interval_secs: u64,
 
     /// HTTP/2 server-side keep-alive PING timeout in seconds (default: 10).
+    /// Only meaningful when `http2_keep_alive_interval_secs > 0`. Must be
+    /// strictly less than the interval.
     #[serde(default = "default_http2_keep_alive_timeout_secs")]
     pub http2_keep_alive_timeout_secs: u64,
 
@@ -168,15 +180,43 @@ pub struct ServerTimeoutConfig {
     /// Bounds memory amplification when a single connection multiplexes many streams.
     #[serde(default = "default_http2_max_concurrent_streams")]
     pub http2_max_concurrent_streams: u32,
+
+    /// Hard maximum age for each inbound accepted connection in seconds
+    /// (default: 1800, 0 = disabled). Enforced by Roxy's vendored hudsucker
+    /// proxy path. When reached, roxy starts hyper graceful shutdown, then
+    /// force-closes after `max_connection_age_grace_secs` if the peer has not
+    /// drained. This bounds healthy idle h2 connections that ACK all PINGs.
+    #[serde(default = "default_max_connection_age_secs")]
+    pub max_connection_age_secs: u64,
+
+    /// Grace window after max connection age before force-close (default: 30).
+    /// Must be > 0 when max_connection_age_secs > 0.
+    #[serde(default = "default_max_connection_age_grace_secs")]
+    pub max_connection_age_grace_secs: u64,
+
+    /// Timeout for reading the first bytes after CONNECT upgrade (default: 15,
+    /// 0 = disabled). Closes clients that send CONNECT then never send the TLS
+    /// ClientHello / tunnel payload.
+    #[serde(default = "default_connect_initial_read_timeout_secs")]
+    pub connect_initial_read_timeout_secs: u64,
+
+    /// Timeout for the MITM TLS server handshake after CONNECT (default: 15,
+    /// 0 = disabled). Closes partial ClientHello / stalled TLS handshakes.
+    #[serde(default = "default_tls_handshake_timeout_secs")]
+    pub tls_handshake_timeout_secs: u64,
 }
 
 impl Default for ServerTimeoutConfig {
     fn default() -> Self {
         Self {
             http1_header_read_timeout_secs: default_http1_header_read_timeout_secs(),
-            http2_keep_alive_interval_secs: default_http2_keep_alive_interval_secs(),
+            http2_keep_alive_interval_secs: default_server_http2_keep_alive_interval_secs(),
             http2_keep_alive_timeout_secs: default_http2_keep_alive_timeout_secs(),
             http2_max_concurrent_streams: default_http2_max_concurrent_streams(),
+            max_connection_age_secs: default_max_connection_age_secs(),
+            max_connection_age_grace_secs: default_max_connection_age_grace_secs(),
+            connect_initial_read_timeout_secs: default_connect_initial_read_timeout_secs(),
+            tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
         }
     }
 }
@@ -185,8 +225,84 @@ fn default_http1_header_read_timeout_secs() -> u64 {
     15
 }
 
+fn default_server_http2_keep_alive_interval_secs() -> u64 {
+    20
+}
+
 fn default_http2_max_concurrent_streams() -> u32 {
     256
+}
+
+fn default_max_connection_age_secs() -> u64 {
+    30 * 60
+}
+
+fn default_max_connection_age_grace_secs() -> u64 {
+    30
+}
+
+fn default_connect_initial_read_timeout_secs() -> u64 {
+    15
+}
+
+fn default_tls_handshake_timeout_secs() -> u64 {
+    15
+}
+
+/// Kernel TCP keep-alive configuration for the listening socket.
+///
+/// All time values are in seconds. Applied via `socket2::TcpKeepalive` on the
+/// bind socket; Linux inherits these onto every accepted connection.
+///
+/// Defaults (`time_secs=60`, `interval_secs=30`, `retries=4`) give roughly
+/// `60 + 4*30 = 180s` worst-case dead-peer detection — gentle enough to avoid
+/// the constant 15s/15s control-plane chatter the previous hardcoded values
+/// produced, while still detecting truly dead peers within ~3 minutes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TcpKeepaliveConfig {
+    /// Enable SO_KEEPALIVE on the listening socket (default: true).
+    #[serde(default = "default_tcp_keepalive_enabled")]
+    pub enabled: bool,
+
+    /// Idle seconds before the first keep-alive probe is sent (default: 60).
+    /// Maps to `TCP_KEEPIDLE`. Must be > 0 when `enabled = true`.
+    #[serde(default = "default_tcp_keepalive_time_secs")]
+    pub time_secs: u64,
+
+    /// Seconds between successive keep-alive probes (default: 30).
+    /// Maps to `TCP_KEEPINTVL`. Must be > 0 when `enabled = true`.
+    #[serde(default = "default_tcp_keepalive_interval_secs")]
+    pub interval_secs: u64,
+
+    /// Number of unacknowledged probes before declaring the peer dead
+    /// (default: 4, Linux-only — maps to `TCP_KEEPCNT`). On non-Linux this
+    /// field is parsed but ignored.
+    #[serde(default = "default_tcp_keepalive_retries")]
+    pub retries: u32,
+}
+
+impl Default for TcpKeepaliveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_tcp_keepalive_enabled(),
+            time_secs: default_tcp_keepalive_time_secs(),
+            interval_secs: default_tcp_keepalive_interval_secs(),
+            retries: default_tcp_keepalive_retries(),
+        }
+    }
+}
+
+fn default_tcp_keepalive_enabled() -> bool {
+    true
+}
+fn default_tcp_keepalive_time_secs() -> u64 {
+    60
+}
+fn default_tcp_keepalive_interval_secs() -> u64 {
+    30
+}
+fn default_tcp_keepalive_retries() -> u32 {
+    4
 }
 
 /// Optional runtime metrics configuration.
@@ -417,6 +533,78 @@ impl ProxyConfig {
             }
         }
 
+        // Validate connection/timeout configs to reject poisoned settings.
+        if let Some(st) = &self.server_timeouts {
+            if st.http2_keep_alive_interval_secs > 0
+                && st.http2_keep_alive_timeout_secs >= st.http2_keep_alive_interval_secs
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "server_timeouts.http2_keep_alive_timeout_secs ({}) must be strictly less than http2_keep_alive_interval_secs ({})",
+                    st.http2_keep_alive_timeout_secs, st.http2_keep_alive_interval_secs
+                )));
+            }
+            if st.http2_keep_alive_interval_secs > 0 && st.http2_keep_alive_timeout_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "server_timeouts.http2_keep_alive_timeout_secs must be > 0 when http2_keep_alive_interval_secs > 0"
+                        .to_string(),
+                ));
+            }
+            if st.max_connection_age_secs > 0 && st.max_connection_age_grace_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "server_timeouts.max_connection_age_grace_secs must be > 0 when max_connection_age_secs > 0"
+                        .to_string(),
+                ));
+            }
+            if st.max_connection_age_secs > 0
+                && st.max_connection_age_grace_secs >= st.max_connection_age_secs
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "server_timeouts.max_connection_age_grace_secs ({}) must be less than max_connection_age_secs ({})",
+                    st.max_connection_age_grace_secs, st.max_connection_age_secs
+                )));
+            }
+            if st.http2_keep_alive_interval_secs > 0 && st.max_connection_age_secs == 0 {
+                tracing::warn!(
+                    target: "proxy",
+                    interval_secs = st.http2_keep_alive_interval_secs,
+                    "server_timeouts.http2_keep_alive_interval_secs > 0 while max_connection_age_secs = 0: \
+                     healthy idle h2 clients can ACK PINGs forever and hold sockets open indefinitely. \
+                     Set max_connection_age_secs to bound connection lifetime."
+                );
+            }
+        }
+        if let Some(p) = &self.pool {
+            if p.http2_keep_alive_interval_secs > 0
+                && p.http2_keep_alive_timeout_secs >= p.http2_keep_alive_interval_secs
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "pool.http2_keep_alive_timeout_secs ({}) must be strictly less than http2_keep_alive_interval_secs ({})",
+                    p.http2_keep_alive_timeout_secs, p.http2_keep_alive_interval_secs
+                )));
+            }
+            if p.http2_keep_alive_interval_secs > 0 && p.http2_keep_alive_timeout_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "pool.http2_keep_alive_timeout_secs must be > 0 when http2_keep_alive_interval_secs > 0"
+                        .to_string(),
+                ));
+            }
+        }
+        if let Some(k) = &self.tcp_keepalive
+            && k.enabled
+        {
+            if k.time_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "tcp_keepalive.time_secs must be > 0 when enabled = true (set enabled: false to disable SO_KEEPALIVE)"
+                        .to_string(),
+                ));
+            }
+            if k.interval_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "tcp_keepalive.interval_secs must be > 0 when enabled = true".to_string(),
+                ));
+            }
+        }
+
         // Validate credit config references, uniqueness, reset_schedule format, and max_delay_ms cap
         let mut seen_credit_rules = std::collections::HashSet::new();
         for credit in &self.credits {
@@ -473,6 +661,94 @@ listen: "0.0.0.0:8080"
         let config = ProxyConfig::from_str(yaml).unwrap();
         assert_eq!(config.listen, "0.0.0.0:8080");
         assert!(config.rules.is_empty());
+    }
+
+    #[test]
+    fn test_server_h2_keep_alive_default_enabled_with_max_age() {
+        // h2 PING remains enabled for dead-peer detection; max age bounds echo chambers.
+        let st = ServerTimeoutConfig::default();
+        assert!(
+            st.http2_keep_alive_interval_secs > 0,
+            "inbound h2 keep-alive should default ON to detect dead h2 peers"
+        );
+        assert!(
+            st.max_connection_age_secs > 0,
+            "max connection age must default ON to bound healthy idle h2 peers"
+        );
+    }
+
+    #[test]
+    fn test_pool_h2_keep_alive_default_enabled() {
+        // Pool/outbound stays enabled — pooled connections to dead upstreams need detection.
+        let p = PoolConfig::default();
+        assert!(
+            p.http2_keep_alive_interval_secs > 0,
+            "pool h2 keep-alive must default ON to evict dead upstream connections"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_h2_timeout_ge_interval_server() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+server_timeouts:
+  http2_keep_alive_interval_secs: 10
+  http2_keep_alive_timeout_secs: 10
+"#;
+        let err = ProxyConfig::from_str(yaml).unwrap_err().to_string();
+        assert!(err.contains("strictly less"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_h2_timeout_ge_interval_pool() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+pool:
+  http2_keep_alive_interval_secs: 5
+  http2_keep_alive_timeout_secs: 5
+"#;
+        let err = ProxyConfig::from_str(yaml).unwrap_err().to_string();
+        assert!(err.contains("strictly less"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_tcp_keepalive_zero_time() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+tcp_keepalive:
+  enabled: true
+  time_secs: 0
+  interval_secs: 30
+"#;
+        let err = ProxyConfig::from_str(yaml).unwrap_err().to_string();
+        assert!(err.contains("time_secs must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_max_age_grace_ge_age() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+server_timeouts:
+    max_connection_age_secs: 30
+    max_connection_age_grace_secs: 30
+"#;
+        let err = ProxyConfig::from_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("must be less than max_connection_age_secs"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_allows_tcp_keepalive_disabled_with_zero_time() {
+        let yaml = r#"
+listen: "0.0.0.0:8080"
+tcp_keepalive:
+  enabled: false
+  time_secs: 0
+  interval_secs: 0
+"#;
+        ProxyConfig::from_str(yaml).expect("disabled keepalive should bypass zero checks");
     }
 
     #[test]

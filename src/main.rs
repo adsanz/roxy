@@ -9,7 +9,6 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use hudsucker::{
-    Proxy,
     rcgen::{CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose},
     rustls::{ClientConfig, crypto::aws_lc_rs},
 };
@@ -24,7 +23,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use arc_swap::ArcSwap;
 use roxy::config::ProxyConfig;
-use roxy::proxy::{RoxyAuthority, RoxyHandler, SharedConfig};
+use roxy::proxy::{ConnectionLifecycle, RoxyAuthority, RoxyHandler, RoxyProxy, SharedConfig};
 use roxy::ratelimit::{CreditManager, CreditRuleConfig, RateLimiter, ResetSchedule};
 use roxy::rules::RuleIndex;
 
@@ -386,7 +385,7 @@ async fn main() {
     });
 
     // ---------------------------------------------------------
-    // Inbound TCP Keepalive via socket2 - prevents zombie connections when clients disappear without proper TCP teardown (e.g. mobile clients, bad network, OOM kills inside containers...)
+    // Inbound TCP Keepalive via socket2 - configurable, prevents zombie connections when clients disappear without proper TCP teardown (e.g. mobile clients, bad network, OOM kills inside containers). Defaults to 60s idle / 30s probe / 4 retries (~3min dead-peer detection). See `tcp_keepalive:` in config.example.yaml.
     // ---------------------------------------------------------
     let domain = socket2::Domain::for_address(addr);
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
@@ -400,14 +399,30 @@ async fn main() {
         .set_nonblocking(true)
         .expect("Failed to set nonblocking");
 
-    // Inject 15s TCP Keepalive into the Listener.
-    // Linux inherits this to all incoming client connections!
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(std::time::Duration::from_secs(15))
-        .with_interval(std::time::Duration::from_secs(15));
-    socket
-        .set_tcp_keepalive(&keepalive)
-        .expect("Failed to set TCP keepalive");
+    // Apply configurable TCP Keepalive to the listener.
+    // Linux inherits this to all incoming client connections.
+    let ka_config = config.tcp_keepalive.clone().unwrap_or_default();
+    if ka_config.enabled {
+        let mut keepalive = socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(ka_config.time_secs))
+            .with_interval(std::time::Duration::from_secs(ka_config.interval_secs));
+        #[cfg(target_os = "linux")]
+        {
+            keepalive = keepalive.with_retries(ka_config.retries);
+        }
+        socket
+            .set_tcp_keepalive(&keepalive)
+            .expect("Failed to set TCP keepalive");
+        info!(
+            target: "proxy",
+            tcp_keepalive_time_secs = ka_config.time_secs,
+            tcp_keepalive_interval_secs = ka_config.interval_secs,
+            tcp_keepalive_retries = ka_config.retries,
+            "Inbound TCP keepalive enabled"
+        );
+    } else {
+        info!(target: "proxy", "Inbound TCP keepalive disabled by config");
+    }
 
     socket.bind(&addr.into()).expect("Failed to bind socket");
     socket.listen(1024).expect("Failed to listen on socket");
@@ -464,8 +479,7 @@ async fn main() {
     // This builder also serves the MITM'd HTTPS streams (via internal
     // `serve_stream`), so a single fix benefits both pipelines.
     let timeouts = config.server_timeouts.clone().unwrap_or_default();
-    let mut server_builder =
-        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    let mut server_builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     {
         let mut h1 = server_builder.http1();
         // A Timer is mandatory for `header_read_timeout` to function — otherwise
@@ -474,9 +488,7 @@ async fn main() {
             .title_case_headers(true)
             .preserve_header_case(true);
         if timeouts.http1_header_read_timeout_secs > 0 {
-            h1.header_read_timeout(Duration::from_secs(
-                timeouts.http1_header_read_timeout_secs,
-            ));
+            h1.header_read_timeout(Duration::from_secs(timeouts.http1_header_read_timeout_secs));
         }
     }
     {
@@ -487,9 +499,7 @@ async fn main() {
             h2.keep_alive_interval(Some(Duration::from_secs(
                 timeouts.http2_keep_alive_interval_secs,
             )))
-            .keep_alive_timeout(Duration::from_secs(
-                timeouts.http2_keep_alive_timeout_secs,
-            ));
+            .keep_alive_timeout(Duration::from_secs(timeouts.http2_keep_alive_timeout_secs));
         }
         if timeouts.http2_max_concurrent_streams > 0 {
             h2.max_concurrent_streams(timeouts.http2_max_concurrent_streams);
@@ -502,8 +512,22 @@ async fn main() {
         http2_keep_alive_interval_secs = timeouts.http2_keep_alive_interval_secs,
         http2_keep_alive_timeout_secs = timeouts.http2_keep_alive_timeout_secs,
         http2_max_concurrent_streams = timeouts.http2_max_concurrent_streams,
+        max_connection_age_secs = timeouts.max_connection_age_secs,
+        max_connection_age_grace_secs = timeouts.max_connection_age_grace_secs,
+        connect_initial_read_timeout_secs = timeouts.connect_initial_read_timeout_secs,
+        tls_handshake_timeout_secs = timeouts.tls_handshake_timeout_secs,
         "Inbound server timeouts configured"
     );
+
+    let lifecycle = ConnectionLifecycle {
+        max_connection_age: (timeouts.max_connection_age_secs > 0)
+            .then(|| Duration::from_secs(timeouts.max_connection_age_secs)),
+        max_connection_age_grace: Duration::from_secs(timeouts.max_connection_age_grace_secs),
+        connect_initial_read_timeout: (timeouts.connect_initial_read_timeout_secs > 0)
+            .then(|| Duration::from_secs(timeouts.connect_initial_read_timeout_secs)),
+        tls_handshake_timeout: (timeouts.tls_handshake_timeout_secs > 0)
+            .then(|| Duration::from_secs(timeouts.tls_handshake_timeout_secs)),
+    };
 
     // Spawn opt-in runtime metrics task. Lets operators correlate live tokio
     // task count with `ss -tan | grep ESTAB` count to verify leak fixes.
@@ -534,7 +558,6 @@ async fn main() {
         info!(target: "runtime", interval_secs, "Runtime metrics task spawned");
     }
 
-
     // Build and start proxy
     let result = if config.unsafe_skip_verify {
         warn!(
@@ -562,18 +585,18 @@ async fn main() {
             .enable_http2()
             .wrap_connector(http_connector);
 
-        Proxy::builder()
-            .with_listener(tokio_listener)
-            .with_ca(ca)
-            .with_http_connector(connector)
-            .with_client(client_builder)
-            .with_server(server_builder)
-            .with_http_handler(handler)
-            .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown)))
-            .build()
-            .expect("Failed to create proxy")
-            .start()
-            .await
+        RoxyProxy::new(
+            tokio_listener,
+            ca,
+            connector,
+            client_builder,
+            server_builder,
+            handler,
+            shutdown_signal(Arc::clone(&shutdown)),
+            lifecycle,
+        )
+        .start()
+        .await
     } else {
         // Safe Mode: Inject custom HTTP connector with 15s TCP Keepalive
         let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
@@ -587,18 +610,18 @@ async fn main() {
             .enable_http2()
             .wrap_connector(http_connector);
 
-        Proxy::builder()
-            .with_listener(tokio_listener)
-            .with_ca(ca)
-            .with_http_connector(connector)
-            .with_client(client_builder)
-            .with_server(server_builder)
-            .with_http_handler(handler)
-            .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown)))
-            .build()
-            .expect("Failed to create proxy")
-            .start()
-            .await
+        RoxyProxy::new(
+            tokio_listener,
+            ca,
+            connector,
+            client_builder,
+            server_builder,
+            handler,
+            shutdown_signal(Arc::clone(&shutdown)),
+            lifecycle,
+        )
+        .start()
+        .await
     };
 
     if let Err(e) = result {
