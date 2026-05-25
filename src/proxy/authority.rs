@@ -40,7 +40,7 @@ const NOT_BEFORE_OFFSET: i64 = 60;
 /// Unlike Hudsucker's RcgenAuthority which only sends the leaf certificate,
 /// this implementation sends both the leaf and CA certificates. This is
 /// required for clients that need to verify the full certificate chain
-/// (e.g., Node.js, n8n, strict TLS clients).
+/// (e.g., Node.js, strict TLS clients).
 ///
 /// # Certificate Chain
 ///
