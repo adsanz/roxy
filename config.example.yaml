@@ -40,12 +40,37 @@ server_timeouts:
   # HTTP/1 header-read timeout — kills slow-loris clients that open a socket
   # and send headers extremely slowly (or never). Set to 0 to disable.
   http1_header_read_timeout_secs: 15
-  # HTTP/2 server-side keep-alive PINGs — detect clients whose TCP socket is
-  # gone but never closed cleanly. Set interval to 0 to disable.
+  # HTTP/2 server-side keep-alive PINGs detect h2 peers that are dead at the
+  # application protocol level even though TCP still looks established.
+  # Keep this enabled for dead-peer detection; max_connection_age_secs below
+  # is what bounds healthy idle peers that ACK PINGs forever.
   http2_keep_alive_interval_secs: 20
-  http2_keep_alive_timeout_secs: 10
+  http2_keep_alive_timeout_secs: 10  # must be < interval when interval > 0
   # Bound multiplexing fan-out per h2 connection (0 = unbounded).
   http2_max_concurrent_streams: 256
+  # Vendored hudsucker InternalProxy/accept-loop deadline knobs.
+  # max_connection_age_secs is the hard cap that prevents healthy-but-idle h2
+  # clients from holding sockets forever by ACKing every PING. On expiry roxy
+  # asks hyper to gracefully drain, then force-closes after the grace window.
+  max_connection_age_secs: 1800       # 30 minutes, 0 = disabled
+  max_connection_age_grace_secs: 30   # must be < max_connection_age_secs
+  # CONNECT-specific gaps in upstream hudsucker 0.24.0 now covered by roxy's
+  # vendored proxy path.
+  connect_initial_read_timeout_secs: 15
+  tls_handshake_timeout_secs: 15
+
+# Kernel TCP keepalive applied to the listening socket (Linux inherits onto
+# every accepted client connection). Tunes how long the OS waits before
+# declaring a silent peer dead.
+#
+# Defaults (60/30/4) give ~3 min worst-case dead-peer detection,
+# set `enabled: false` to skip SO_KEEPALIVE entirely (peers will then
+# only be detected as dead via real TCP errors / RST). `retries` is Linux-only.
+tcp_keepalive:
+  enabled: true
+  time_secs: 60       # TCP_KEEPIDLE — idle seconds before first probe
+  interval_secs: 30   # TCP_KEEPINTVL — seconds between probes
+  retries: 4          # TCP_KEEPCNT  — unACK'd probes before kill (Linux only)
 
 # Optional runtime metrics (NOT hot-reloadable). Logs tokio alive-task and
 # worker count every N seconds; useful for verifying that connection leak

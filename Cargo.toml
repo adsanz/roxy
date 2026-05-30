@@ -10,7 +10,7 @@ hudsucker = { version = "0.24", features = ["rcgen-ca", "http2"] }
 # Async runtime (hudsucker uses tokio)
 tokio = { version = "1", features = ["full", "signal"] }
 
-# Utils to tackle internal configs
+# Hyper utilities used directly by the vendored proxy control path
 hyper-util = { version = "0.1", features = ["full"] }
 
 # Configuration
@@ -47,13 +47,18 @@ tikv-jemallocator = "0.6"
 # HTTP types (re-exported by hudsucker but we need them directly)
 http = "1"
 hyper = "1"
+hyper-tungstenite = "0.19"
 
-# Advanced networking with sockets enabled us to set inbound SO_KEEPALIVE flags on connections. This saves the proxy from origin zombie connections by dropping them after 15 seconds.
-socket2 = "0.5"
+# Advanced socket options for listener-level TCP keepalive on accepted client connections.
+socket2 = { version = "0.5", features = ["all"] }
 
-# TLS — direct dep for custom upstream certificate verification
+# TLS — direct deps for custom upstream certificate verification and MITM handshakes
 rustls = { version = "0.23", default-features = false }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "aws-lc-rs"] }
+tokio-rustls = "0.26"
+
+# Graceful task shutdown for the vendored proxy accept loop
+tokio-graceful = "0.2"
 
 # PEM certificate parsing
 pem = "3"

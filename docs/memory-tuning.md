@@ -128,6 +128,10 @@ server_timeouts:
   http2_keep_alive_interval_secs: 20    # default: 20, 0 = disabled
   http2_keep_alive_timeout_secs: 10     # default: 10
   http2_max_concurrent_streams: 256     # default: 256, 0 = unbounded
+  max_connection_age_secs: 1800         # default: 1800, 0 = disabled
+  max_connection_age_grace_secs: 30     # default: 30
+  connect_initial_read_timeout_secs: 15 # default: 15, 0 = disabled
+  tls_handshake_timeout_secs: 15        # default: 15, 0 = disabled
 ```
 
 **Not hot-reloadable.** These values are baked into the listener at startup; changes require restarting the proxy.
@@ -138,10 +142,14 @@ server_timeouts:
 | `http2_keep_alive_interval_secs` | Server-side PING interval. Detects dead clients whose TCP socket is gone but never closed. |
 | `http2_keep_alive_timeout_secs` | If no PING ACK in this window, send GOAWAY and close. |
 | `http2_max_concurrent_streams` | Bounds per-connection multiplexing fan-out — protects against an attacker opening one h2 socket and allocating thousands of streams. |
+| `max_connection_age_secs` | Hard cap for each inbound accepted / MITM connection. Bounds healthy idle h2 clients that ACK PINGs forever. |
+| `max_connection_age_grace_secs` | Drain window after max age before force-close. |
+| `connect_initial_read_timeout_secs` | Timeout for clients that send CONNECT then never send the TLS ClientHello / tunnel payload. |
+| `tls_handshake_timeout_secs` | Timeout for stalled MITM TLS handshakes after CONNECT. |
 
-### Known Gaps (Hudsucker)
+### Vendored Hudsucker Path
 
-The `CONNECT` initial-read, TLS handshake, and non-intercept tunnel paths cannot be timed out from Roxy's side — see [hudsucker-gaps.md](./hudsucker-gaps.md) for details and operational mitigations (kernel TCP keepalive tuning is recommended).
+Roxy vendors the small `hudsucker 0.24.0` proxy control path (`src/proxy/bounded.rs`) so these deadlines can be enforced around both the outer accepted connection and the inner MITM `serve_stream(...)` path. This keeps HTTP/2 PINGs useful for dead-peer detection while `max_connection_age_secs` prevents healthy idle clients from creating an infinite PING/ACK echo chamber.
 
 ## Runtime Metrics
 

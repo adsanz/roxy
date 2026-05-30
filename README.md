@@ -20,7 +20,7 @@ Roxy combines ACL filtering, header mangling, rate limiting, and TLS inspection 
 - **Per-Rule Log Level** — Silence noisy-but-expected traffic with `log_level: off` (or `trace`/`debug`/`info`/`warn`/`error`) on individual rules
 - **Hot Reload** — Automatic config reload without restart, preserving rate limit and credit state
 - **Method-Indexed Rules** — O(1) rule lookup by HTTP method
-- **Stability Hardening** — Inbound server timeouts (slow-loris protection, h2 keep-alive, stream caps) and upstream HTTP/2 keep-alive prevent socket/RSS growth on long-running deployments ([docs](docs/memory-tuning.md), [hudsucker gaps](docs/hudsucker-gaps.md))
+- **Stability Hardening** — Inbound server timeouts (slow-loris protection, h2 keep-alive, stream caps, vendored max-age deadlines) and upstream HTTP/2 keep-alive prevent socket/RSS growth on long-running deployments ([docs](docs/memory-tuning.md), [hudsucker gaps](docs/hudsucker-gaps.md))
 - **Runtime Observability** — Optional periodic logging of tokio alive-task / worker count for leak detection ([docs](docs/memory-tuning.md))
 - **Memory-Conscious** — jemalloc allocator, configurable caches and pools ([docs](docs/memory-tuning.md))
 
@@ -110,6 +110,10 @@ server_timeouts:
   http2_keep_alive_interval_secs: 20
   http2_keep_alive_timeout_secs: 10
   http2_max_concurrent_streams: 256
+  max_connection_age_secs: 1800
+  max_connection_age_grace_secs: 30
+  connect_initial_read_timeout_secs: 15
+  tls_handshake_timeout_secs: 15
 
 # Optional: log tokio runtime metrics every N seconds (leak detection)
 # runtime_metrics:
@@ -162,7 +166,7 @@ If a new config fails to parse or contains invalid rules, the current config rem
 ## Architecture
 
 ```
-Request → [TLS Intercept] → [Parse] → [ACL] → [RateLimit / Credit / Throttle] → [Mangle] → [Forward] → Response
+[Accept + Deadlines] → [TLS Intercept] → [Parse] → [ACL] → [RateLimit / Credit / Throttle] → [Mangle] → [Forward] → Response
 ```
 
 | Module | Responsibility |
@@ -177,30 +181,39 @@ Request → [TLS Intercept] → [Parse] → [ACL] → [RateLimit / Credit / Thro
 | `ratelimit/credit.rs` | Credit-based rate limiting with scheduled resets |
 | `proxy/handler.rs` | Hudsucker `HttpHandler` — request/response pipeline |
 | `proxy/authority.rs` | Custom CA with full certificate chain for MITM |
+| `proxy/bounded.rs` | Vendored hudsucker 0.24.0 proxy control path with Roxy connection deadlines |
 | `proxy/tls.rs` | Upstream TLS connector (rustls) with optional verifier skip |
 | `error.rs` | Unified error types |
 | `util.rs` | Stack-allocated string utilities (zero-alloc key formatting) |
 
 ### Key Dependencies
 
-| Crate | Purpose |
-|-------|---------|
-| [hudsucker](https://crates.io/crates/hudsucker) | MITM HTTP/S proxy framework |
-| [nom](https://crates.io/crates/nom) | Zero-copy parser combinators for the rule DSL |
-| [globset](https://crates.io/crates/globset) | Pre-compiled glob pattern matching |
-| [dashmap](https://crates.io/crates/dashmap) | Concurrent hashmap for rate limit storage |
-| [arc-swap](https://crates.io/crates/arc-swap) | Lock-free atomic config swap for hot reload |
-| [tikv-jemallocator](https://crates.io/crates/tikv-jemallocator) | jemalloc global allocator |
-| [tokio](https://crates.io/crates/tokio) | Async runtime |
-| [tracing](https://crates.io/crates/tracing) | Structured logging |
+Roxy still builds on Hudsucker, but some networking pieces are direct dependencies because `proxy/bounded.rs` vendors Hudsucker 0.24.0's private proxy control path to enforce connection deadlines.
+
+| Area | Crates | Purpose |
+|------|--------|---------|
+| Proxy framework | [hudsucker](https://crates.io/crates/hudsucker) | Public MITM proxy traits, body types, certificate authority traits, and shared framework pieces |
+| HTTP runtime | [hyper](https://crates.io/crates/hyper), [hyper-util](https://crates.io/crates/hyper-util), [http](https://crates.io/crates/http) | Client/server builders, request/response types, upgrades, and HTTP/2 keep-alive tuning used by the vendored proxy path |
+| Async runtime | [tokio](https://crates.io/crates/tokio), [tokio-graceful](https://crates.io/crates/tokio-graceful) | Async IO, signal handling, task spawning, and graceful shutdown for accepted connections |
+| TLS | [rustls](https://crates.io/crates/rustls), [hyper-rustls](https://crates.io/crates/hyper-rustls), [tokio-rustls](https://crates.io/crates/tokio-rustls) | Upstream TLS verification/skip-verify support and MITM TLS handshakes after CONNECT |
+| WebSockets | [hyper-tungstenite](https://crates.io/crates/hyper-tungstenite) | Upgrade detection and websocket forwarding in the vendored proxy path |
+| Socket options | [socket2](https://crates.io/crates/socket2) | Listener-level TCP keepalive settings inherited by accepted sockets |
+| Configuration | [serde](https://crates.io/crates/serde), [serde_yml](https://crates.io/crates/serde_yml), [arc-swap](https://crates.io/crates/arc-swap) | YAML parsing, validation, and lock-free config hot reload |
+| Rule engine | [nom](https://crates.io/crates/nom), [globset](https://crates.io/crates/globset) | Zero-copy rule DSL parsing and pre-compiled glob matching |
+| Rate limiting | [dashmap](https://crates.io/crates/dashmap), [chrono](https://crates.io/crates/chrono) | Concurrent counters and scheduled credit resets |
+| Certificates | [moka](https://crates.io/crates/moka), [pem](https://crates.io/crates/pem), [time](https://crates.io/crates/time), [rand](https://crates.io/crates/rand) | Async certificate cache, PEM parsing, certificate validity timestamps, and serial generation |
+| Observability | [tracing](https://crates.io/crates/tracing), [tracing-subscriber](https://crates.io/crates/tracing-subscriber) | Structured JSON logs and runtime filtering |
+| Memory | [tikv-jemallocator](https://crates.io/crates/tikv-jemallocator) | jemalloc global allocator on non-MSVC targets to reduce RSS retention |
 
 ## Testing
 
 ```bash
 cargo test                    # Run all tests
+cargo test --release          # Run optimized tests before production-adjacent changes
 cargo test -- --nocapture     # With output
 cargo test rules::parser      # Specific module
 cargo test ratelimit
+cargo build --release         # Build target/release/roxy before local e2e runs
 ```
 
 ### Test Coverage
